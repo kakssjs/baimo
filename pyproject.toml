@@ -1,0 +1,24 @@
+[project]
+name = "baimo"
+version = "0.1.0"
+description = "Video to white-model comparison film (original on top, Blender white model below)"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "numpy>=2.0",
+    "pillow>=10.0",
+    "python-multipart>=0.0.9",
+    "scipy>=1.13",
+    "torch>=2.9",
+    "transformers>=4.45",
+    "uvicorn>=0.30",
+]
+
+# torch comes from the PyTorch CUDA index (the RTX 50 series needs a recent CUDA build).
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }

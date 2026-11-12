@@ -1,0 +1,77 @@
+"""Creates jobs and runs their stages; progress is recorded in jobs/<id>/job.json."""
+import json
+import re
+import uuid
+import zipfile
+from datetime import datetime
+from pathlib import Path
+
+from . import media
+from .config import JOBS
+
+ID_RE = re.compile(r"\d{8}-\d{6}-[0-9a-f]{6}")
+FINISHED = ("done", "failed")
+
+
+def job_dir(job_id):
+    """Directory of an existing job, or None if the id is malformed or unknown."""
+    d = JOBS / job_id
+    return d if ID_RE.fullmatch(job_id) and (d / "job.json").exists() else None
+
+
+def load(d):
+    return json.loads((d / "job.json").read_text(encoding="utf-8"))
+
+
+def _save(d, state):
+    (d / "job.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def create_job(input_name):
+    """Make jobs/<id>/ in the 'queued' state and return its directory."""
+    job_id = f"{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
+    d = JOBS / job_id
+    d.mkdir(parents=True)
+    _save(d, {"id": job_id, "input": Path(input_name).name, "stage": "queued", "error": None})
+    return d
+
+
+def fail(d, message):
+    _save(d, {**load(d), "stage": "failed", "error": message})
+
+
+def process(d, src, crop=None):
+    """Run every stage for one job. Never raises; the outcome is in job.json."""
+    state = load(d)
+
+    def enter(stage):
+        state["stage"] = stage
+        _save(d, state)
+
+    try:
+        enter("ingest")
+        state["source"] = media.ingest(src, d, crop)
+        enter("analyse")
+        media.estimate_depth(d)
+        enter("build")
+        media.build_relief(d, state["source"])
+        enter("render")
+        media.render_shot(d / "shot01.blend", d / "white.mp4", state["source"])
+        # The .blend points at the depth frames by relative path, so they ship together.
+        with zipfile.ZipFile(d / "scene.zip", "w", zipfile.ZIP_DEFLATED) as z:
+            z.write(d / "shot01.blend", "shot01.blend")
+            for png in sorted((d / "depth").glob("*.png")):
+                z.write(png, f"depth/{png.name}")
+        enter("compose")
+        state["final"] = media.compose(d)
+        enter("done")
+    except Exception as e:
+        state["error"] = str(e)
+        enter("failed")
+
+
+def run_job(src, crop=None):
+    """Create and process a job in one call (command-line use). Returns the job directory."""
+    d = create_job(src)
+    process(d, src, crop)
+    return d

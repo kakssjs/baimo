@@ -1,0 +1,16 @@
+# Machine-specific settings. Tool values are either a name found on PATH or a full path.
+[tools]
+blender = 'E:\blander\blender.exe'
+ffmpeg = "ffmpeg"
+ffprobe = "ffprobe"
+
+[paths]
+# Folder containing whitebox.py (the Blender white-model helper library).
+whitebox_scripts = 'C:\Users\kakssjs\.claude\skills\blender-whitebox\scripts'
+
+# Upload limits. Render time scales with duration x resolution.
+[limits]
+max_upload_mb = 200
+max_duration_s = 60
+max_width = 1920
+max_height = 1080

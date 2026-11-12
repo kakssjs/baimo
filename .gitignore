@@ -1,0 +1,6 @@
+jobs/
+_vendor/
+WB_SmokeTest/output/
+/*.mp4
+__pycache__/
+.venv/
