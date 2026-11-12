@@ -64,9 +64,9 @@
 <main>
   <h1>Baimo</h1>
   <p class="muted">Upload a video and get it back with the original on top and a white-model version below.</p>
-  <p class="notice">The white model is built automatically in Blender: the set becomes a white relief
-    estimated from each frame, and each person becomes a sphere-and-box figure. It is approximate,
-    and it can flicker or miss people on dark or fast shots.</p>
+  <p class="notice">Built automatically in Blender: the set becomes a white clay model shaped from
+    every frame, and each person becomes a sphere-and-box figure. Results are approximate; dark or
+    very fast shots come out softer.</p>
 
   <section>
     <label id="drop">
@@ -88,7 +88,7 @@
 </main>
 
 <script>
-const STAGES = [["queued", "Waiting"], ["ingest", "Preparing video"], ["analyse", "Finding depth and people"],
+const STAGES = [["queued", "Waiting"], ["ingest", "Preparing video"], ["analyse", "Reading depth and people"],
                 ["build", "Building 3D scene"], ["render", "Rendering in Blender"],
                 ["compose", "Combining"], ["done", "Done"]];
 const LABEL = Object.fromEntries(STAGES.concat([["failed", "Failed"]]));

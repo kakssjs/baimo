@@ -11,8 +11,8 @@ For a short description of what the site does, see [README.md](README.md).
  You                     Website                         Processing (one video at a time)
  ───                     ───────                         ────────────────────────────────
  choose a video  ──▶  POST /api/jobs  ──▶ queue ──▶  1 ingest    ffmpeg   → source.mp4
-                                                     2 analyse   AI       → depth/*.png, figures.json
- watch the stages ◀── GET /api/jobs  ◀── job.json ◀─ 3 build     Blender  → shot01.blend
+                                                     2 analyse   AI       → depth/*.png, scene.json
+ watch the stages ◀── GET /api/jobs  ◀── job.json ◀─ 3 build     Blender  → scene.blend
                                                      4 render    Blender  → white.mp4
  play / download ◀──  GET …/files/…  ◀─────────────  5 compose   ffmpeg   → final.mp4
 ```
@@ -24,23 +24,54 @@ Every video becomes one **job** with its own folder `jobs/<id>/`. The page polls
 |---|---|---|---|
 | `queued` (Waiting) | Upload saved, waiting for the worker | `server/app.py` | `input.<ext>`, `job.json` |
 | `ingest` (Preparing video) | Check limits; convert to constant frame rate, even size, H.264 + AAC | `media.ingest` | `source.mp4` |
-| `analyse` (Finding depth and people) | Depth Anything V2 estimates a depth map for every frame. RT-DETR finds people, ViTPose finds their 17 body keypoints, and overlapping boxes are linked into tracks. Each person is pressed out of the depth map | `pipeline/depth.py`, `pipeline/figures.py` | `depth/NNNN.png` (16-bit, white = near), `figures.json` |
-| `build` (Building 3D scene) | Blender builds a clay-white grid displaced by the depth frames, a keyframed sphere-and-box figure per tracked person, an orthographic camera and a sun light | `pipeline/blender/build_relief.py` | `shot01.blend` |
-| `render` (Rendering in Blender) | Blender renders the scene at the source size, frame rate and frame count; scene is zipped | `pipeline/blender/render_shot.py` | `white.mp4`, `scene.zip` |
-| `compose` (Combining) | Original stacked over the white model, original audio kept | `media.compose` | `final.mp4` |
+| `analyse` (Reading depth and people) | See section 2 | `pipeline/analyse.py`, `depth.py`, `figures.py` | `depth/NNNNNN.png`, `scene.json` |
+| `build` (Building 3D scene) | Blender builds the set surface, the figures, the camera and the light | `pipeline/blender/build_scene.py` | `scene.blend` |
+| `render` (Rendering in Blender) | Blender renders every frame; the scene is zipped with its depth frames | `pipeline/blender/render_shot.py` | `white.mp4`, `scene.zip` |
+| `compose` (Combining) | Original (scaled to the render size) stacked over the white model, original audio kept | `media.compose` | `final.mp4` |
 | `done` / `failed` | Result shown, or the error message | `pipeline/job.py` | — |
-
-Why the white model lines up with the footage: the relief is a flat grid the shape of the frame,
-pushed toward an orthographic camera. Each point stays on its own pixel, so the bottom half matches
-the top half frame for frame. Figures live in the same frame space: each body part is a cube
-stretched between two keypoints (the head is a sphere), placed at the depth the relief had for
-that person, so they also line up and cast shadows on the set.
 
 ---
 
-## 2. First-time setup
+## 2. How a frame becomes a white model
 
-Needed on the machine (all already installed here):
+**Analyse (Python, GPU).** For every frame:
+
+1. **Shot cuts** are found first, by checking whether each frame still correlates with the one
+   before it. Cuts reset the smoothing and the people tracking.
+2. **People**: RT-DETR finds each person, ViTPose finds their 17 body keypoints, and overlapping
+   boxes in consecutive frames are linked into tracks.
+3. **Depth**: Depth Anything 3 (monocular, large) estimates depth at 1008 pixels wide. It is
+   blended lightly with the previous frame to reduce shimmer.
+4. **People are erased from the depth map**: inside each person's box, anything standing out in
+   front of the surface on either side is pressed back onto it. Their depth is noted first, so
+   their figure can be placed where they stood.
+5. **Edges are sharpened** with a guided filter, which snaps the depth map's soft edges onto the
+   real edges in the video frame.
+6. The result is stored as a 16-bit image (white = near).
+
+After the last frame, each shot gets a **scale to metres** (from the average torso length of the
+people in it, or a default distance when nobody is fully visible), and every tracked person's
+keypoints are turned into **3D joints in metres**.
+
+**Build (Blender).** One scene, in the camera's own space with the camera at the origin:
+
+- **Set**: a 640-column grid that fills the view one unit in front of the camera. A Geometry
+  Nodes modifier pushes every vertex out along its line of sight to the depth in that frame's
+  image, so the set is a true perspective surface that lines up with the footage pixel for
+  pixel. Sharp folds stay as hard creases; everything else is smooth-shaded clay.
+- **Figures**: for each tracked person, a sphere head, a box torso, box arms and legs, and a
+  small teal visor that shows which way the face points. Parts are real 3D objects stretched
+  between the 3D joints and keyframed on every frame; a person seen from behind has no visor.
+- **Light**: a soft sky, a sun from over the camera's left shoulder, ambient occlusion and soft
+  shadows, so figures cast shadows on the set.
+
+**Render.** EEVEE, at the source size enlarged so the long side is at least 1280 pixels.
+
+---
+
+## 3. First-time setup
+
+Needed on the machine (all already in place here):
 
 | Tool | Where | Check |
 |---|---|---|
@@ -49,19 +80,28 @@ Needed on the machine (all already installed here):
 | uv | on PATH | `uv --version` |
 | NVIDIA GPU + driver | — | `nvidia-smi` |
 | `whitebox.py` helper | folder in `config.toml` → `[paths].whitebox_scripts` | file exists |
+| Depth Anything 3 source | folder in `config.toml` → `[paths].depth_anything_3` | see below |
 
-Install the Python packages (FastAPI, PyTorch with CUDA, transformers — about 3 GB the first time):
+Depth Anything 3 is not on PyPI in a form this project can install, so it is used from a clone
+(only its inference code is loaded; its own heavy extras are not needed):
+
+```powershell
+git clone --depth 1 https://github.com/ByteDance-Seed/Depth-Anything-3.git _vendor/Depth-Anything-3
+```
+
+Install the Python packages (FastAPI, PyTorch with CUDA, transformers, OpenCV — about 3 GB the
+first time):
 
 ```powershell
 uv sync
 ```
 
-The three AI models (about 600 MB together) download from Hugging Face automatically the first
-time a video is processed. Without a GPU the depth stage still runs on the CPU, but much slower.
+The AI models (about 2 GB together) download from Hugging Face automatically the first time a
+video is processed. Without a GPU the analysis still runs, but far too slowly to be useful.
 
 ---
 
-## 3. Daily use
+## 4. Daily use
 
 Start the site:
 
@@ -72,7 +112,7 @@ uv run uvicorn server.app:app --port 8000
 Open <http://localhost:8000>, then:
 
 1. **Choose a video** (or drop one on the box). Limits are shown under the box.
-2. **Watch the stages** light up. A 11-second 592×240 clip takes about 2 minutes on the RTX 5060.
+2. **Watch the stages** light up. Timing is in section 8.
 3. **Play the result** — original on top, white model below.
 4. **Download** the comparison video, the white model alone, or the Blender scene.
 5. Older videos stay in **Your videos**; select one to see it again, or delete it.
@@ -92,37 +132,36 @@ uv run python -m pipeline bad19affd9d603bbb1ae2e3fe3f4a12b.mp4 --crop "592:240:0
 
 `--crop` is `width:height:x:y` in source pixels. The result lands in `jobs/<id>/final.mp4`.
 
-**Editing the white model in Blender** — unzip `scene.zip`, open `shot01.blend` (the `depth`
-folder must stay next to it). The object `Relief` has a *Displace* modifier called `Depth`;
-its strength, the `WB_Sun` light and the `WB_Clay` material control the look. Figures are in
-the `WB/Figures` collections, one per person, with ordinary keyframes on every part.
+**Editing the white model in Blender** — unzip `scene.zip` and open `scene.blend` (the `depth`
+folder must stay next to it). The `Set` object carries the `Depth` Geometry Nodes modifier;
+figures are in the `WB/Figures` collections, one per person, with ordinary keyframes on every
+part; `WB_Sun` and the `WB_Clay` material control the look.
 
 ---
 
-## 4. Settings and tuning
+## 5. Settings and tuning
 
 | To change | Edit |
 |---|---|
-| Blender / ffmpeg locations | `config.toml` → `[tools]` |
+| Blender / ffmpeg / library locations | `config.toml` → `[tools]`, `[paths]` |
 | Upload limits (size, length, resolution) | `config.toml` → `[limits]` |
-| How far the relief sticks out | `STRENGTH` in `pipeline/blender/build_relief.py` |
-| Mesh detail | `COLS` in `build_relief.py` |
-| Light direction, brightness, ambient | the `WB_Sun` and world lines in `build_relief.py` |
-| Flicker vs. responsiveness | `SMOOTH` in `pipeline/depth.py` (0 = none, higher = steadier but more trailing) |
-| How fast depth contrast adapts after a cut | `RANGE_WINDOW` in `pipeline/depth.py` |
-| Depth model | `MODEL` in `pipeline/depth.py` (the Small model is Apache-2.0; Base and Large are non-commercial) |
+| Depth model and its working resolution (quality vs. speed) | `MODEL`, `PROCESS_RES` in `pipeline/depth.py` |
+| Shimmer vs. trailing on moving edges | `SMOOTH` in `pipeline/analyse.py` |
+| How strongly edges snap to the picture (lower = sharper, more surface texture) | the `8e-3` term in `sharpen_edges`, `pipeline/depth.py` |
+| How much of a person is erased from the set | the `0.97` threshold and box padding in `lift_out`, `pipeline/depth.py` |
+| Assumed lens (changes how deep the scene looks) | `LENS` in `pipeline/analyse.py` |
 | Which people count (confidence, minimum size, shortest track) | `MIN_PERSON_SCORE`, `MIN_HEIGHT`, `MIN_TRACK` in `pipeline/figures.py` |
 | When a limb is drawn | `MIN_KEYPOINT` in `pipeline/figures.py` |
-| Figure jitter | `SMOOTH` in `pipeline/figures.py` |
-| Figure colours, limb thickness, head size | `FIGURE_COLOURS` and `placements()` in `build_relief.py` |
+| Figure colours, proportions, visor | `FIGURE_COLOURS` and `placements()` in `pipeline/blender/build_scene.py` |
+| Light, clay colour, render samples | the light and render sections at the end of `build_scene.py` |
+| Smallest output width | `output_size` in `pipeline/media.py` |
 | Stage names on the page | `STAGES` in `web/index.html` |
 
-Restart the server after changing Python files or `config.toml`. The page (`web/index.html`) only
-needs a browser refresh.
+Restart the server after changing Python files or `config.toml`. The page only needs a refresh.
 
 ---
 
-## 5. API
+## 6. API
 
 | Endpoint | Purpose |
 |---|---|
@@ -137,20 +176,20 @@ Interactive reference: <http://localhost:8000/docs>.
 
 ---
 
-## 6. When something goes wrong
+## 7. When something goes wrong
 
 | Symptom | Likely cause and fix |
 |---|---|
 | Job fails: "could not be read as a video" | Not a video, or a damaged file |
 | Job fails with a size / length / resolution message | Over the limits in `config.toml`; trim the clip or raise the limit |
 | Job fails: "blender not found" / "ffmpeg not found" | Fix the path in `config.toml`; after installing ffmpeg, open a new terminal so PATH updates |
-| Fails at *Estimating depth* the first time | No internet for the one-time model download, or out of GPU memory (close other GPU apps) |
-| White model is flat or soft | Dark, blurry or close-up shots carry little depth; raise `STRENGTH`, or accept it for that shot |
+| Fails at *Reading depth and people* with "No module named depth_anything_3" | The clone in section 3 is missing or `[paths].depth_anything_3` points elsewhere |
+| Fails at that stage the first time, other message | No internet for the one-time model downloads, or out of GPU memory (close other GPU apps) |
 | A person has no figure | Too small, too dark, or seen for under 8 frames; lower `MIN_HEIGHT`, `MIN_PERSON_SCORE` or `MIN_TRACK` |
-| A figure changes colour mid-video | The person was lost and found again, so a new track started; expected after cuts |
+| A figure changes colour mid-video | The person was lost and found again, so a new track started |
 | A figure is missing arms or legs | The pose model was unsure of those joints; lower `MIN_KEYPOINT` (may add wrong limbs) |
-| White model shimmers | Depth is estimated frame by frame; raise `SMOOTH` |
-| Depth contrast "breathes" for a second after a cut | Expected; lower `RANGE_WINDOW` to shorten it |
+| A soft lump remains where a person stood | The person filled most of the frame, so there was no surface beside them to fill from |
+| Set looks soft or lumpy | Dark, blurry or very low-resolution footage carries little depth detail |
 | `uv` fails with "os error 17" inside the Claude desktop app | Set `$env:UV_CACHE_DIR = "C:\Users\kakssjs\.cache\uv"` first (not needed in a normal terminal) |
 | Server was closed mid-job | Start it again; unfinished jobs restart automatically from the first stage |
 
@@ -158,42 +197,51 @@ The full error text of a failed job is in `jobs/<id>/job.json`.
 
 ---
 
-## 7. What was verified (2026-11-12)
+## 8. What was verified
 
-- Command line and website both processed the film part of `bad19affd9d603bbb1ae2e3fe3f4a12b.mp4`
-  (592×240, 30 fps, 327 frames) to a 592×480 `final.mp4` with audio, in about 100 seconds.
-- White model frames line up with the footage; walls and props are recognisable in well-lit
-  shots and soft in the dark close-ups.
-- Nine person tracks were found in that clip. Figures sit on the people, follow them, and show
-  full bodies for the background people and head-and-torso for close-ups. Seen in six sampled
-  frames, not reviewed frame by frame.
-- Page: stage indicator, playable result, three downloads, failed-upload message, delete, no
-  layout overflow at phone or desktop width.
-- API: status codes for unknown jobs and files, range requests, delete refused while running.
-- Server stopped during *Estimating depth* and restarted: the job ran again and finished.
+Checked on 2026-11-13 with an RTX 5060 laptop GPU (8 GB), using the film halves of the two sample
+videos in this folder.
 
-Not verified: the native file picker and real drag-and-drop (uploads were injected by script),
-the over-size upload rejection, videos near the 60 s / 1080p limits, and CPU-only processing.
+| Clip | Source | Result | Total time | Of which analysis |
+|---|---|---|---|---|
+| Studio lot (well lit, handheld) | 592×240, 30 fps, 327 frames | 1280×1036, 327 frames, audio | 211 s (command line) | about 150 s |
+| Corridor (very dark, 5 shots) | 1280×528, 24 fps, 472 frames | 1280×1056, 472 frames, audio | 296 s (website) | 169 s |
+
+So expect roughly 0.4 s per frame for analysis plus 0.25 s per frame for rendering: a 60-second
+clip at 30 fps takes about 20 minutes.
+
+- **Look, studio lot:** the set shows the wall, door panels, timber frame and lumber pile as a
+  clean clay surface; all visible people became figures with correct poses and visors; four
+  consecutive frames were compared and were stable.
+- **Look, corridor:** figures are placed correctly in most shots; the set is recognisable where
+  there is light and soft where the picture is nearly black; in the darkest opening frames the
+  person was not detected.
+- **Website:** the corridor clip went through every stage in the browser's API to a finished
+  result, and `scene.zip` downloaded (176 MB for that clip: the depth frames are large).
+- **Earlier checks that still apply:** page layout at phone and desktop width, failed-upload
+  message, delete, restart recovery, status codes for unknown jobs and files.
+
+Not verified: the whole videos frame by frame (six to ten sampled frames each), the native file
+picker and real drag-and-drop, the over-size upload rejection, clips near the 60 s limit, and
+`uv run` from a normal terminal (the environment's Python was called directly).
 
 ---
 
-## 8. What is not built, and the next steps
+## 9. Known limits and next steps
 
-People are now sphere-and-box figures, as in the two sample videos. The **set is still a depth
-relief**: one continuous surface seen from a fixed camera, not simple walls, floors and props.
+- **The set is a sculpted surface, not separate walls and props.** It follows the footage
+  closely, but it is one mesh per frame seen from the camera, so it cannot be walked around.
+  An earlier attempt to fit real walls and boxes from a multi-view reconstruction gave nonsense
+  geometry on a handheld shot and was dropped; it would need a much stronger reconstruction.
+- **No camera path.** The camera stays at the origin and the set changes around it. The light
+  therefore moves with the camera.
+- **Figures face the camera.** Joints sit at one depth per person, so figures follow poses but
+  do not turn in depth.
+- **Identity is not kept** across cuts or after someone is hidden: they return as a new figure.
+- **Scale and lens are estimates**, so distances in the `.blend` are approximate.
+- One job at a time; no progress percentage inside a stage; no accounts, so anyone who can open
+  the site sees and can delete every job; Blender/ffmpeg error text includes server paths.
 
-Next steps, in the order that closes that gap:
-
-1. **Better figures.** Keep one figure (and colour) per person across cuts and gaps; estimate a
-   3D pose so figures can turn instead of staying flat-on; remove the leftover outline in the
-   relief with a proper person mask.
-2. **Simple set geometry.** Replace the background relief with fitted planes and boxes (floor,
-   walls, large props) built with `whitebox.py`, one scene per shot. Needs real shot-cut detection
-   and a camera estimate per shot.
-3. **Blockout mode on the page.** A mode selector (relief / blockout), and re-rendering after an
-   edited `.blend` is uploaded.
-4. **For public hosting.** Accounts or private job links, cleaned-up error text, automatic deletion
-   of old jobs, cancel button, per-stage progress percentage, terms for uploaded footage.
-
-Other known limits: one job at a time; no progress percentage inside a stage; anyone who can open
-the site sees and can delete every job; error text for Blender/ffmpeg failures includes server paths.
+Next steps, in order of value: keep one figure per person across gaps; a real person mask
+(segmentation) for cleaner removal; a recovered camera path with world-fixed light; then, for
+public hosting, accounts, old-job cleanup, a cancel button and cleaned-up error text.

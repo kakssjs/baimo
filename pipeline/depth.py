@@ -1,120 +1,99 @@
-"""Stage 3: source.mp4 -> depth/0001.png ... (16-bit greyscale, white = near) and figures.json
-(tracked people with 2D poses and their depth).
-
-Run as its own process so GPU memory is released before Blender starts:
-    python -m pipeline.depth JOB_DIR
-"""
-import json
-import subprocess
+"""Depth for single frames (Depth Anything 3, monocular) and the clean-up applied to it."""
 import sys
-from pathlib import Path
+import types
 
+import cv2
 import numpy as np
 import torch
-from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
 from . import figures
-from .config import tool
-from .media import probe
+from .config import DA3_SRC
 
-MODEL = "depth-anything/Depth-Anything-V2-Small-hf"  # Apache-2.0; the Base/Large weights are non-commercial
-STORE_WIDTH = 512   # depth maps are kept at this width; the relief mesh is coarser than that anyway
-BATCH = 8
-RANGE_WINDOW = 31   # frames over which the near/far range is averaged (adapts to each shot)
-SMOOTH = 0.5        # weight of the previous frame in the temporal average (reduces flicker)
+MODEL = "depth-anything/DA3MONO-LARGE"  # Apache-2.0
+PROCESS_RES = 1008     # long side the model works at; depth maps come back at this size
+NEAR = 0.2             # depth (model units) that maps to white in the stored 16-bit frames
 
 
-def lift_out(d, pose, scale):
-    """Return the person's depth and press their bump in the depth map d down to the background,
-    so the relief shows the set and the Blender figure stands where the person was."""
-    x0, y0, x1, y1 = (int(round(v * scale)) for v in pose["box"])
-    region = d[max(y0, 0):y1 + 1, max(x0, 0):x1 + 1]
+class DepthEstimator:
+    def __init__(self, device):
+        if DA3_SRC not in sys.path:
+            sys.path.insert(0, DA3_SRC)
+        # The package's export helpers import video and 3D-viewer libraries that are not needed
+        # here (and not installed); only inference is used, so that module is replaced by a stub.
+        stub = types.ModuleType("depth_anything_3.utils.export")
+        stub.export = None
+        sys.modules.setdefault("depth_anything_3.utils.export", stub)
+        from depth_anything_3.api import DepthAnything3
+        self.model = DepthAnything3.from_pretrained(MODEL).to(device).eval()
+
+    def __call__(self, frame):
+        """frame: HxWx3 uint8. Returns relative depth (h, w) float32, larger = farther."""
+        with torch.inference_mode():
+            p = self.model.inference([frame], process_res=PROCESS_RES)
+        depth = np.maximum(p.depth[0].astype(np.float32), 1e-3)
+        sky = getattr(p, "sky", None)
+        if sky is not None and sky[0].any() and not sky[0].all():
+            depth[sky[0]] = 2.0 * np.percentile(depth[~sky[0]], 99)   # sky has no depth: push it far back
+        return depth
+
+
+def sharpen_edges(depth, frame):
+    """Guided filter: snaps the depth map's soft edges onto the edges of the video frame, and
+    smooths the surfaces in between. Works on inverse depth, guided by the frame's brightness."""
+    h, w = depth.shape
+    guide = cv2.cvtColor(cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA), cv2.COLOR_RGB2GRAY)
+    guide = guide.astype(np.float32) / 255.0
+    src = 1.0 / depth
+    k = (13, 13)
+    mean_g, mean_s = cv2.blur(guide, k), cv2.blur(src, k)
+    var_g = cv2.blur(guide * guide, k) - mean_g * mean_g
+    cov = cv2.blur(guide * src, k) - mean_g * mean_s
+    a = cov / (var_g + 8e-3)
+    b = mean_s - a * mean_g
+    out = cv2.blur(a, k) * guide + cv2.blur(b, k)
+    return 1.0 / np.clip(out, 1.0 / depth.max(), 1.0 / depth.min())
+
+
+def lift_out(depth, person, sx, sy):
+    """Return a person's depth and erase them from the depth map, so the set behind them is
+    what gets built and a figure can stand in their place.
+
+    Inside the person's box, each row gets a baseline running straight from the surface left of
+    the box to the surface right of it; whatever stands out in front of that baseline is pressed
+    back onto it.
+    """
+    h, w = depth.shape
+    x0, y0, x1, y1 = person["box"]
+    px, py = 0.1 * (x1 - x0), 0.06 * (y1 - y0)
+    xa, xb = max(int((x0 - px) * sx), 0), min(int((x1 + px) * sx) + 1, w)
+    ya, yb = max(int((y0 - py) * sy), 0), min(int((y1 + py) * sy) + 1, h)
+    region = depth[ya:yb, xa:xb]
     if region.size == 0:
-        return 0.0
-    body = [d[min(max(int(y * scale), 0), d.shape[0] - 1), min(max(int(x * scale), 0), d.shape[1] - 1)]
-            for x, y, score in pose["kp"][5:13] if score >= figures.MIN_KEYPOINT]
-    z = float(np.median(body)) if body else float(np.percentile(region, 75))
-    # Background level = what surrounds the box at the top and sides (the bottom is usually floor).
-    background = float(np.median(np.concatenate([region[0], region[:, 0], region[:, -1]])))
-    if z > background + 0.03:
-        region[region > background + 0.25 * (z - background)] = background
+        return float(np.median(depth))
+    body = [depth[int(np.clip(y * sy, 0, h - 1)), int(np.clip(x * sx, 0, w - 1))]
+            for x, y, score in person["kp"][[5, 6, 11, 12]] if score >= figures.MIN_KEYPOINT]
+    z = float(np.median(body)) if body else float(np.percentile(region, 25))
+
+    def edge(x):    # the column just outside the box, steadied vertically; None at the frame edge
+        if not 0 <= x < w:
+            return None
+        return cv2.medianBlur(np.ascontiguousarray(depth[ya:yb, x:x + 1]), 5)[:, 0] if yb - ya >= 5 else depth[ya:yb, x]
+
+    left, right = edge(xa - 1), edge(xb)
+    if left is None and right is None:      # the box spans the frame: fall back to its far side
+        left = right = np.full(yb - ya, np.percentile(region, 90), dtype=np.float32)
+    left, right = (right if left is None else left), (left if right is None else right)
+    t = np.linspace(0, 1, xb - xa, dtype=np.float32)
+    baseline = left[:, None] * (1 - t) + right[:, None] * t
+    mask = np.zeros((h, w), dtype=np.uint8)
+    mask[ya:yb, xa:xb] = region < 0.97 * baseline
+    np.copyto(region, baseline, where=region < 0.97 * baseline)
+    # Soften the patch and its seam.
+    mask = cv2.dilate(mask, np.ones((9, 9), np.uint8)).astype(bool)
+    depth[mask] = cv2.GaussianBlur(depth, (0, 0), 4)[mask]
     return z
 
 
-def main(job_dir):
-    src = job_dir / "source.mp4"
-    meta = probe(src)
-    w, h = meta["width"], meta["height"]
-    sw = min(STORE_WIDTH, w)
-    sh = max(2, round(h * sw / w))
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    processor = AutoImageProcessor.from_pretrained(MODEL)
-    model = AutoModelForDepthEstimation.from_pretrained(MODEL).to(device).eval()
-    find_people = figures.PoseEstimator(device)
-
-    # Pass 1: raw model output per frame (relative inverse depth: larger = nearer).
-    reader = subprocess.Popen([tool("ffmpeg"), "-v", "error", "-i", str(src),
-                               "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], stdout=subprocess.PIPE)
-    raw, batch, people = [], [], []
-
-    def flush():
-        inputs = processor(images=batch, return_tensors="pt").to(device)
-        with torch.inference_mode():
-            pred = model(**inputs).predicted_depth
-        pred = torch.nn.functional.interpolate(pred[:, None], size=(sh, sw), mode="bicubic",
-                                               align_corners=False)[:, 0]
-        raw.extend(pred.float().cpu().numpy().astype(np.float16))
-        people.extend(find_people(batch))
-        batch.clear()
-
-    while len(buf := reader.stdout.read(w * h * 3)) == w * h * 3:
-        batch.append(np.frombuffer(buf, np.uint8).reshape(h, w, 3))
-        if len(batch) == BATCH:
-            flush()
-    if batch:
-        flush()
-    if reader.wait() or not raw:
-        raise RuntimeError("Could not decode frames from source.mp4.")
-
-    # Pass 2: normalise with a near/far range averaged over neighbouring frames (a per-frame
-    # range would pulse; one range for the whole clip flattens shots with little depth),
-    # smooth over time, then write the PNG sequence.
-    ranges = np.array([np.percentile(f.astype(np.float32), (1, 99)) for f in raw])
-    pad = RANGE_WINDOW // 2
-    kernel = np.ones(RANGE_WINDOW) / RANGE_WINDOW
-    lows, highs = (np.convolve(np.pad(col, pad, mode="edge"), kernel, mode="valid") for col in ranges.T)
-    out_dir = job_dir / "depth"
-    out_dir.mkdir(exist_ok=True)
-    writer = subprocess.Popen([tool("ffmpeg"), "-v", "error", "-y", "-f", "rawvideo",
-                               "-pix_fmt", "gray16le", "-s", f"{sw}x{sh}", "-i", "-",
-                               "-start_number", "1", str(out_dir / "%04d.png")], stdin=subprocess.PIPE)
-    tracks = figures.track(people)
-    on_frame = [[] for _ in raw]
-    for t in tracks:
-        for offset, pose in enumerate(t["poses"]):
-            if pose:
-                on_frame[t["start"] + offset].append(pose)
-    prev = None
-    for frame, lo, hi, poses in zip(raw, lows, highs, on_frame):
-        d = np.clip((frame.astype(np.float32) - lo) / max(hi - lo, 1e-6), 0, 1)
-        for pose in poses:
-            pose["z"] = lift_out(d, pose, sw / w)
-        prev = d if prev is None else SMOOTH * prev + (1 - SMOOTH) * d
-        writer.stdin.write((prev * 65535).astype("<u2").tobytes())
-    writer.stdin.close()
-    if writer.wait():
-        raise RuntimeError("Could not write the depth frames.")
-    for t in tracks:    # steady each figure's depth over time, then make it JSON-friendly
-        z = None
-        for pose in filter(None, t["poses"]):
-            z = pose["z"] if z is None else SMOOTH * z + (1 - SMOOTH) * pose["z"]
-            pose.update(z=round(float(z), 4), kp=np.round(pose["kp"], 2).tolist())
-            del pose["box"]
-        t["start"] += 1  # Blender frames start at 1
-    (job_dir / "figures.json").write_text(json.dumps({"min_keypoint": figures.MIN_KEYPOINT, "tracks": tracks}), encoding="utf-8")
-    print(f"depth: {len(raw)} frames at {sw}x{sh} on {device}, {len(tracks)} figure(s)")
-
-
-if __name__ == "__main__":
-    main(Path(sys.argv[1]))
+def encode(depth):
+    """16-bit image of inverse depth: white = NEAR, black = infinitely far."""
+    return (np.clip(NEAR / depth, 0, 1) * 65535).astype(np.uint16)

@@ -52,14 +52,15 @@ def process(d, src, crop=None):
         enter("ingest")
         state["source"] = media.ingest(src, d, crop)
         enter("analyse")
-        media.estimate_depth(d)
+        media.analyse(d)
         enter("build")
-        media.build_relief(d, state["source"])
+        size = media.output_size(state["source"])
+        media.build_scene(d, size)
         enter("render")
-        media.render_shot(d / "shot01.blend", d / "white.mp4", state["source"])
+        media.render(d / "scene.blend", d / "white.mp4", size)
         # The .blend points at the depth frames by relative path, so they ship together.
         with zipfile.ZipFile(d / "scene.zip", "w", zipfile.ZIP_DEFLATED) as z:
-            z.write(d / "shot01.blend", "shot01.blend")
+            z.write(d / "scene.blend", "scene.blend")
             for png in sorted((d / "depth").glob("*.png")):
                 z.write(png, f"depth/{png.name}")
         enter("compose")

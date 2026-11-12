@@ -6,12 +6,20 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",
     "numpy>=2.0",
+    "opencv-python-headless>=4.10",
     "pillow>=10.0",
     "python-multipart>=0.0.9",
     "scipy>=1.13",
     "torch>=2.9",
     "transformers>=4.45",
     "uvicorn>=0.30",
+    # Needed to import Depth Anything 3 from its source folder (see config.toml).
+    "addict",
+    "einops",
+    "evo",
+    "imageio",
+    "omegaconf",
+    "torchvision",
 ]
 
 # torch comes from the PyTorch CUDA index (the RTX 50 series needs a recent CUDA build).
@@ -22,3 +30,4 @@ explicit = true
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }

@@ -7,24 +7,27 @@ A local website that turns a video into a comparison film:
 ┌──────────────────────────┐
 │   original video         │
 ├──────────────────────────┤
-│   white model (Blender)  │   same size, same timing, original sound
+│   white model (Blender)  │   same framing, same timing, original sound
 └──────────────────────────┘
 ```
 
 ## What it can do
 
-- **Upload a video in the browser** and watch it move through the stages: preparing, estimating
-  depth, building the 3D relief, rendering in Blender, combining.
-- **Convert every frame to a white model automatically.** An AI depth model (Depth Anything V2)
-  measures how far each part of the picture is; Blender turns that into a clay-white 3D relief of
-  the set, lights it, and renders it. No manual modelling.
+- **Upload a video in the browser** and watch it move through the stages: preparing, reading
+  depth and people, building the 3D scene, rendering in Blender, combining.
+- **Turn the set into a white clay model.** A large depth model reads every frame at high
+  resolution; Blender shapes a perspective surface from it, with edges snapped to the real
+  edges in the picture, and renders it with soft shadows and ambient occlusion.
 - **Replace people with sphere-and-box figures.** Each person is detected, followed through the
-  shot, and rebuilt as a simple mannequin (sphere head, box torso, box arms and legs) that copies
-  their pose frame by frame. Each tracked person gets a colour.
-- **Keep the two halves in step.** The white model has the same resolution, frame rate and frame
-  count as the footage and lines up with it pixel for pixel.
+  shot, erased from the set, and rebuilt as a 3D mannequin — sphere head, box torso, box arms
+  and legs — that copies their pose frame by frame and casts a shadow on the set. A teal visor
+  shows which way the face points. Each tracked person gets a colour.
+- **Keep the two halves in step.** The white model lines up with the footage pixel for pixel
+  and has the same frame rate and frame count.
+- **Render at a watchable size.** Small uploads are enlarged so each half is at least 1280
+  pixels on its long side.
 - **Play and download the results:** the stacked comparison video, the white model on its own,
-  and the editable Blender scene (`.blend` plus its depth frames).
+  and the editable Blender scene.
 - **Keep a history** of processed videos, with delete.
 - **Recover from a restart:** videos that were waiting or processing when the server stopped are
   run again when it starts.
@@ -32,14 +35,14 @@ A local website that turns a video into a comparison film:
 
 ## What it cannot do yet
 
-- The **set is still a depth relief** (one sculpted surface seen from the front), not separate
-  walls, floors and props like the two sample videos in this folder. That is the next step.
-- Figures are flat-on to the camera: they follow the 2D pose and depth of each person, not a true
-  3D skeleton. Arms or legs the pose model cannot see are left out.
+- The set is one sculpted surface seen from the camera, not separate walls, floors and props,
+  and there is no recovered camera path. It cannot be walked around in Blender.
+- Figures follow poses but always face the camera; arms or legs the pose model cannot see are
+  left out.
 - A person who is lost and found again (after a cut, or when hidden) comes back as a new figure
   with a different colour. Small or very dark people can be missed.
-- Traces of the outline of a person can remain in the relief behind their figure.
-- Dark, blurry or extreme close-up shots give a soft, flat relief, and the surface can shimmer.
+- Dark, blurry or very low-resolution footage gives a softer set, and a soft lump can remain
+  where a person filled most of the frame.
 - One video is processed at a time. Limits: 200 MB, 60 seconds, 1920×1080 (portrait allowed).
 - It is built for one machine and one user: no accounts, so anyone who can open the site sees
   every video.
@@ -48,7 +51,11 @@ A local website that turns a video into a comparison film:
 
 Requirements: Windows, Blender 5.x, ffmpeg, uv, an NVIDIA GPU. Paths are set in `config.toml`.
 
-Install the Python packages (first time only, about 3 GB):
+One-time setup (a clone of the depth model's code, then the Python packages, about 3 GB):
+
+```powershell
+git clone --depth 1 https://github.com/ByteDance-Seed/Depth-Anything-3.git _vendor/Depth-Anything-3
+```
 
 ```powershell
 uv sync
@@ -60,8 +67,8 @@ Start the site:
 uv run uvicorn server.app:app --port 8000
 ```
 
-Open <http://localhost:8000>, choose a video, and wait for the result. An 11-second clip takes
-about 2 minutes on an RTX 5060 laptop GPU. The first run also downloads the AI models (~600 MB).
+Open <http://localhost:8000>, choose a video, and wait for the result. The first run also
+downloads the AI models (about 2 GB). Timing is in [WORKFLOW.md](WORKFLOW.md), section 8.
 
 Command line alternative:
 
@@ -74,7 +81,7 @@ uv run python -m pipeline my_clip.mp4
 ```
 baimo/
 ├─ README.md          this file
-├─ WORKFLOW.md        full guide: stages, setup, use, tuning, troubleshooting, next steps
+├─ WORKFLOW.md        full guide: stages, setup, use, tuning, troubleshooting, limits
 ├─ config.toml        tool paths and upload limits
 ├─ pyproject.toml     Python dependencies (uv)
 ├─ server/app.py      website backend: API, job queue, serves the page
@@ -82,15 +89,15 @@ baimo/
 ├─ pipeline/
 │  ├─ job.py          runs the stages for one video, writes job.json
 │  ├─ media.py        ffmpeg steps and Blender launchers
-│  ├─ depth.py        AI depth estimation, writes depth frames and figures.json
+│  ├─ analyse.py      shot cuts, per-frame depth, people; writes depth frames and scene.json
+│  ├─ depth.py        depth model, person removal, edge sharpening
 │  ├─ figures.py      person detection, pose estimation and tracking
-│  └─ blender/        scripts that run inside Blender (build_relief.py, render_shot.py)
+│  └─ blender/        scripts that run inside Blender (build_scene.py, render_shot.py)
 ├─ jobs/              one folder per processed video (not in git)
 ├─ WB_SmokeTest/      earlier Blender white-model experiments
-└─ _vendor/           reference repositories (not in git)
+└─ _vendor/           cloned third-party code (not in git)
 ```
 
-## More
+## Licences of the AI models
 
-See [WORKFLOW.md](WORKFLOW.md) for how each stage works, how to tune the look, the API,
-troubleshooting, what was tested, and the plan for real set geometry.
+Depth Anything 3 Mono-Large, RT-DETR and ViTPose are all released under Apache-2.0.

@@ -7,6 +7,9 @@ ffprobe = "ffprobe"
 [paths]
 # Folder containing whitebox.py (the Blender white-model helper library).
 whitebox_scripts = 'C:\Users\kakssjs\.claude\skills\blender-whitebox\scripts'
+# Source folder of Depth Anything 3 (a clone of github.com/ByteDance-Seed/Depth-Anything-3),
+# relative to this file.
+depth_anything_3 = '_vendor/Depth-Anything-3/src'
 
 # Upload limits. Render time scales with duration x resolution.
 [limits]

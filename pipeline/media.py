@@ -1,4 +1,4 @@
-"""Stage wrappers: probe, ingest (1), depth (3), Blender relief build (4) and render (5), compose (6)."""
+"""Stage wrappers: probe, ingest (1), analyse (2), Blender scene build (3) and render (4), compose (5)."""
 import json
 import subprocess
 import sys
@@ -74,37 +74,43 @@ def ingest(src, job_dir, crop=None):
     return probe(out)
 
 
-def estimate_depth(job_dir):
-    """Stage 3: write depth/NNNN.png and figures.json for source.mp4 (separate process, see depth.py)."""
-    _run([sys.executable, "-m", "pipeline.depth", str(job_dir)], cwd=ROOT)
+def output_size(meta):
+    """Size of each half of the final video: the source size, enlarged so the long side is at
+    least 1280 pixels. Small uploads would otherwise give a coarse white-model render."""
+    k = max(1.0, 1280 / max(meta["width"], meta["height"]))
+    return {**meta, "width": round(meta["width"] * k / 2) * 2, "height": round(meta["height"] * k / 2) * 2}
 
 
-def build_relief(job_dir, meta):
-    """Stage 4: build shot01.blend: a clay relief of the set plus a figure per tracked person."""
+def analyse(job_dir):
+    """Stage 2: write depth/NNNNNN.png and scene.json for source.mp4 (separate process, see analyse.py)."""
+    _run([sys.executable, "-m", "pipeline.analyse", str(job_dir)], cwd=ROOT)
+
+
+def build_scene(job_dir, meta):
+    """Stage 3: build scene.blend: the set surface driven by the depth frames plus a figure per person."""
     job_dir = Path(job_dir)
-    _run([tool("blender"), "-b", *BLENDER_FLAGS, "-P", str(BLENDER_SCRIPTS / "build_relief.py"), "--",
-          "--depth-dir", str(job_dir / "depth"), "--figures", str(job_dir / "figures.json"),
-          "--width", str(meta["width"]),
-          "--height", str(meta["height"]), "--frames", str(meta["frames"]),
-          "--whitebox", WHITEBOX_SCRIPTS, "--out", str(job_dir / "shot01.blend")])
+    _run([tool("blender"), "-b", *BLENDER_FLAGS, "-P", str(BLENDER_SCRIPTS / "build_scene.py"), "--",
+          "--scene", str(job_dir / "scene.json"), "--depth-dir", str(job_dir / "depth"),
+          "--width", str(meta["width"]), "--height", str(meta["height"]),
+          "--whitebox", WHITEBOX_SCRIPTS, "--out", str(job_dir / "scene.blend")])
 
 
-def render_shot(blend, out, meta):
-    """Stage 5: render a .blend with Blender to match meta's width, height, fps and frames."""
+def render(blend, out, meta):
+    """Stage 4: render a .blend with Blender at meta's width, height, fps and frame count."""
     _run([tool("blender"), "-b", str(blend), *BLENDER_FLAGS,
           "-P", str(BLENDER_SCRIPTS / "render_shot.py"), "--", "--out", str(out), "--width", str(meta["width"]),
           "--height", str(meta["height"]), "--fps", meta["fps"], "--frames", str(meta["frames"])])
 
 
 def compose(job_dir):
-    """Stage 6: stack source.mp4 over white.mp4 and keep the source audio -> final.mp4."""
+    """Stage 5: stack source.mp4 (scaled to the render's size) over white.mp4, keep the audio -> final.mp4."""
     job_dir = Path(job_dir)
     top, bottom = probe(job_dir / "source.mp4"), probe(job_dir / "white.mp4")
-    for key in ("width", "height", "fps", "frames"):
+    for key in ("fps", "frames"):
         if top[key] != bottom[key]:
             raise RuntimeError(f"white.mp4 does not match source.mp4: {key} {bottom[key]} != {top[key]}")
     out = job_dir / "final.mp4"
-    _ffmpeg("-i", job_dir / "source.mp4", "-i", job_dir / "white.mp4",
-            "-filter_complex", "[0:v][1:v]vstack=inputs=2[v]", "-map", "[v]", "-map", "0:a?",
-            *H264, "-c:a", "copy", "-movflags", "+faststart", out)
+    _ffmpeg("-i", job_dir / "source.mp4", "-i", job_dir / "white.mp4", "-filter_complex",
+            f"[0:v]scale={bottom['width']}:{bottom['height']}:flags=lanczos,setsar=1[t];[t][1:v]vstack=inputs=2[v]",
+            "-map", "[v]", "-map", "0:a?", *H264, "-c:a", "copy", "-movflags", "+faststart", out)
     return probe(out)

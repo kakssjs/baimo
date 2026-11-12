@@ -11,6 +11,7 @@ with open(ROOT / "config.toml", "rb") as f:
 
 LIMITS = _cfg["limits"]
 WHITEBOX_SCRIPTS = _cfg["paths"]["whitebox_scripts"]
+DA3_SRC = str((ROOT / _cfg["paths"]["depth_anything_3"]).resolve())
 
 
 def tool(name):

@@ -73,7 +73,7 @@ def track(people):
             free.remove(best)
             kp = best["kp"].copy()
             kp[:, :2] = SMOOTH * t["kp"][:, :2] + (1 - SMOOTH) * kp[:, :2]
-            t["poses"] += [None] * (i - t["last"] - 1) + [{"box": best["box"], "kp": kp}]
+            t["poses"] += [None] * (i - t["last"] - 1) + [{**best, "kp": kp}]
             t.update(last=i, box=best["box"], kp=kp)
         for p in free:
             t = {"start": i, "last": i, "box": p["box"], "kp": p["kp"], "poses": [dict(p)]}

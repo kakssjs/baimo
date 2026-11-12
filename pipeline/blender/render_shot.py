@@ -1,4 +1,4 @@
-"""Stage 5: render the opened .blend's scene camera to an H.264 MP4 (no audio).
+"""Stage 4: render the opened .blend's scene camera to an H.264 MP4 (no audio).
 
 Run: blender -b SHOT.blend --factory-startup --python-exit-code 1 -P render_shot.py --
          --out OUT.mp4 --width W --height H --fps NUM/DEN --frames N
