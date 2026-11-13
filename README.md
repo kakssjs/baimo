@@ -14,20 +14,22 @@ A local website that turns a video into a comparison film:
 ## What it can do
 
 - **Upload a video in the browser** and watch it move through the stages: preparing, reading
-  depth and people, building the 3D scene, rendering in Blender, combining.
-- **Turn the set into a white clay model.** A large depth model reads every frame at high
-  resolution; Blender shapes a perspective surface from it, with edges snapped to the real
-  edges in the picture, and renders it with soft shadows and ambient occlusion.
+  the room and people, building the 3D scene, rendering in Blender, combining.
+- **Turn the set into a box room.** A depth model reads every frame and the result is reduced
+  to the big surfaces: floor, back wall, side walls, ceiling. They are built as plain white
+  boxes in Blender, kept steady over each shot, and turn with camera pans.
 - **Replace people with sphere-and-box figures.** Each person is detected, followed through the
-  shot, erased from the set, and rebuilt as a 3D mannequin — sphere head, box torso, box arms
-  and legs — that copies their pose frame by frame and casts a shadow on the set. A teal visor
-  shows which way the face points. Each tracked person gets a colour.
-- **Keep the two halves in step.** The white model lines up with the footage pixel for pixel
-  and has the same frame rate and frame count.
+  shot, and rebuilt as a 3D mannequin — sphere head, box torso, box arms and legs — that copies
+  their pose frame by frame and casts a shadow. A teal visor shows which way the face points.
+  Each tracked person gets a colour. Short moments where a person is missed are bridged.
+- **Stay readable on hard footage.** Because only boxes and figures are drawn, dark or blurred
+  video still gives a clean picture instead of a lumpy surface.
+- **Keep the two halves in step.** Figures sit where the people are in the frame, with the same
+  frame rate and frame count as the footage.
 - **Render at a watchable size.** Small uploads are enlarged so each half is at least 1280
   pixels on its long side.
 - **Play and download the results:** the stacked comparison video, the white model on its own,
-  and the editable Blender scene.
+  and a self-contained, editable Blender scene.
 - **Keep a history** of processed videos, with delete.
 - **Recover from a restart:** videos that were waiting or processing when the server stopped are
   run again when it starts.
@@ -35,14 +37,13 @@ A local website that turns a video into a comparison film:
 
 ## What it cannot do yet
 
-- The set is one sculpted surface seen from the camera, not separate walls, floors and props,
-  and there is no recovered camera path. It cannot be walked around in Blender.
+- The room is always a plain box: no doorways, windows, props or furniture, and its walls only
+  roughly match the real ones. Outdoor scenes still get a back wall.
+- There is no recovered camera path; the camera stays put and the room moves around it.
 - Figures follow poses but always face the camera; arms or legs the pose model cannot see are
   left out.
-- A person who is lost and found again (after a cut, or when hidden) comes back as a new figure
-  with a different colour. Small or very dark people can be missed.
-- Dark, blurry or very low-resolution footage gives a softer set, and a soft lump can remain
-  where a person filled most of the frame.
+- A person who is lost for a while, or reappears after a cut, comes back as a new figure with a
+  different colour. Small or very dark people can be missed.
 - One video is processed at a time. Limits: 200 MB, 60 seconds, 1920×1080 (portrait allowed).
 - It is built for one machine and one user: no accounts, so anyone who can open the site sees
   every video.
@@ -89,8 +90,9 @@ baimo/
 ├─ pipeline/
 │  ├─ job.py          runs the stages for one video, writes job.json
 │  ├─ media.py        ffmpeg steps and Blender launchers
-│  ├─ analyse.py      shot cuts, per-frame depth, people; writes depth frames and scene.json
-│  ├─ depth.py        depth model, person removal, edge sharpening
+│  ├─ analyse.py      shot cuts, per-frame depth, people, room; writes scene.json
+│  ├─ depth.py        depth model and person removal
+│  ├─ room.py         fits and smooths the box room
 │  ├─ figures.py      person detection, pose estimation and tracking
 │  └─ blender/        scripts that run inside Blender (build_scene.py, render_shot.py)
 ├─ jobs/              one folder per processed video (not in git)

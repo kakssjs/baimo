@@ -1,4 +1,4 @@
-"""Depth for single frames (Depth Anything 3, monocular) and the clean-up applied to it."""
+"""Depth for single frames (Depth Anything 3, monocular) and removal of people from it."""
 import sys
 import types
 
@@ -10,8 +10,7 @@ from . import figures
 from .config import DA3_SRC
 
 MODEL = "depth-anything/DA3MONO-LARGE"  # Apache-2.0
-PROCESS_RES = 1008     # long side the model works at; depth maps come back at this size
-NEAR = 0.2             # depth (model units) that maps to white in the stored 16-bit frames
+PROCESS_RES = 756      # long side the model works at; depth maps come back at this size
 
 
 class DepthEstimator:
@@ -35,23 +34,6 @@ class DepthEstimator:
         if sky is not None and sky[0].any() and not sky[0].all():
             depth[sky[0]] = 2.0 * np.percentile(depth[~sky[0]], 99)   # sky has no depth: push it far back
         return depth
-
-
-def sharpen_edges(depth, frame):
-    """Guided filter: snaps the depth map's soft edges onto the edges of the video frame, and
-    smooths the surfaces in between. Works on inverse depth, guided by the frame's brightness."""
-    h, w = depth.shape
-    guide = cv2.cvtColor(cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA), cv2.COLOR_RGB2GRAY)
-    guide = guide.astype(np.float32) / 255.0
-    src = 1.0 / depth
-    k = (13, 13)
-    mean_g, mean_s = cv2.blur(guide, k), cv2.blur(src, k)
-    var_g = cv2.blur(guide * guide, k) - mean_g * mean_g
-    cov = cv2.blur(guide * src, k) - mean_g * mean_s
-    a = cov / (var_g + 8e-3)
-    b = mean_s - a * mean_g
-    out = cv2.blur(a, k) * guide + cv2.blur(b, k)
-    return 1.0 / np.clip(out, 1.0 / depth.max(), 1.0 / depth.min())
 
 
 def lift_out(depth, person, sx, sy):
@@ -92,8 +74,3 @@ def lift_out(depth, person, sx, sy):
     mask = cv2.dilate(mask, np.ones((9, 9), np.uint8)).astype(bool)
     depth[mask] = cv2.GaussianBlur(depth, (0, 0), 4)[mask]
     return z
-
-
-def encode(depth):
-    """16-bit image of inverse depth: white = NEAR, black = infinitely far."""
-    return (np.clip(NEAR / depth, 0, 1) * 65535).astype(np.uint16)

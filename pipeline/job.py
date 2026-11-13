@@ -2,7 +2,6 @@
 import json
 import re
 import uuid
-import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -58,11 +57,6 @@ def process(d, src, crop=None):
         media.build_scene(d, size)
         enter("render")
         media.render(d / "scene.blend", d / "white.mp4", size)
-        # The .blend points at the depth frames by relative path, so they ship together.
-        with zipfile.ZipFile(d / "scene.zip", "w", zipfile.ZIP_DEFLATED) as z:
-            z.write(d / "scene.blend", "scene.blend")
-            for png in sorted((d / "depth").glob("*.png")):
-                z.write(png, f"depth/{png.name}")
         enter("compose")
         state["final"] = media.compose(d)
         enter("done")

@@ -64,9 +64,9 @@
 <main>
   <h1>Baimo</h1>
   <p class="muted">Upload a video and get it back with the original on top and a white-model version below.</p>
-  <p class="notice">Built automatically in Blender: the set becomes a white clay model shaped from
-    every frame, and each person becomes a sphere-and-box figure. Results are approximate; dark or
-    very fast shots come out softer.</p>
+  <p class="notice">Built automatically in Blender in a box style: the set becomes a plain room of
+    walls and floor, and each person becomes a sphere-and-box figure. It shows where things are and
+    how people move, not surface detail.</p>
 
   <section>
     <label id="drop">
@@ -88,7 +88,7 @@
 </main>
 
 <script>
-const STAGES = [["queued", "Waiting"], ["ingest", "Preparing video"], ["analyse", "Reading depth and people"],
+const STAGES = [["queued", "Waiting"], ["ingest", "Preparing video"], ["analyse", "Reading the room and people"],
                 ["build", "Building 3D scene"], ["render", "Rendering in Blender"],
                 ["compose", "Combining"], ["done", "Done"]];
 const LABEL = Object.fromEntries(STAGES.concat([["failed", "Failed"]]));
@@ -139,7 +139,7 @@ function renderDetail() {
             "Download comparison"),
          el("a", {className: "btn", href: files + "white.mp4", download: `baimo-${j.id}-white.mp4`},
             "Download white model only"),
-         el("a", {className: "btn", href: files + "scene.zip", download: `baimo-${j.id}-scene.zip`},
+         el("a", {className: "btn", href: files + "scene.blend", download: `baimo-${j.id}.blend`},
             "Download Blender scene")));
   } else if (j.stage === "failed") {
     parts.push(el("p", {}, "This video could not be processed."),

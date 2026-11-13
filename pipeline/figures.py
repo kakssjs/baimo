@@ -5,11 +5,11 @@ from transformers import AutoProcessor, RTDetrForObjectDetection, VitPoseForPose
 
 DETECTOR = "PekingU/rtdetr_r50vd_coco_o365"   # Apache-2.0
 POSE = "usyd-community/vitpose-base-simple"   # Apache-2.0, 17 COCO keypoints
-MIN_PERSON_SCORE = 0.5
+MIN_PERSON_SCORE = 0.35
 MIN_KEYPOINT = 0.35   # keypoints scored below this are treated as not visible
 MIN_HEIGHT = 0.15     # ignore people shorter than this fraction of the frame height
-MATCH_IOU = 0.3       # a detection continues a track when their boxes overlap at least this much
-MAX_GAP = 5           # frames a person may go undetected before the track ends
+MATCH_IOU = 0.2       # a detection continues a track when their boxes overlap at least this much
+MAX_GAP = 12          # frames a person may go undetected before the track ends
 MIN_TRACK = 8         # shorter tracks are treated as false detections
 SMOOTH = 0.5          # weight of the previous frame's keypoints (reduces jitter)
 
@@ -56,11 +56,19 @@ def _iou(a, b):
     return w * h / ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - w * h)
 
 
+def _between(a, b, t):
+    """Pose part-way from a to b; a joint counts as seen only if both ends saw it."""
+    kp = (1 - t) * a["kp"] + t * b["kp"]
+    kp[:, 2] = np.minimum(a["kp"][:, 2], b["kp"][:, 2])
+    box = [(1 - t) * p + t * q for p, q in zip(a["box"], b["box"])]
+    return {"box": box, "kp": kp, "z": (1 - t) * a["z"] + t * b["z"]}
+
+
 def track(people):
     """Link per-frame detections into tracks.
 
-    Returns a list of {"start": frame_index, "poses": [pose or None, ...]}; a pose is
-    {"box", "kp"} with keypoints smoothed over time. Gaps inside a track are None.
+    Returns a list of {"start": frame_index, "poses": [pose, ...]}; a pose is {"box", "kp", "z"}
+    with keypoints smoothed over time. Short gaps inside a track are bridged by interpolation.
     """
     tracks, open_tracks = [], []
     for i, frame_people in enumerate(people):
@@ -73,7 +81,10 @@ def track(people):
             free.remove(best)
             kp = best["kp"].copy()
             kp[:, :2] = SMOOTH * t["kp"][:, :2] + (1 - SMOOTH) * kp[:, :2]
-            t["poses"] += [None] * (i - t["last"] - 1) + [{**best, "kp": kp}]
+            new, old, gap = {**best, "kp": kp}, t["poses"][-1], i - t["last"]
+            for step in range(1, gap):      # bridge the frames where the person was missed
+                t["poses"].append(_between(old, new, step / gap))
+            t["poses"].append(new)
             t.update(last=i, box=best["box"], kp=kp)
         for p in free:
             t = {"start": i, "last": i, "box": p["box"], "kp": p["kp"], "poses": [dict(p)]}

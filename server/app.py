@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pipeline import job
 from pipeline.config import JOBS, LIMITS, ROOT
 
-DOWNLOADS = ("final.mp4", "white.mp4", "source.mp4", "scene.zip")
+DOWNLOADS = ("final.mp4", "white.mp4", "source.mp4", "scene.blend")
 CHUNK = 1 << 20
 
 _queue = queue.Queue()

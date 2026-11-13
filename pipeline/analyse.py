@@ -1,8 +1,8 @@
-"""Stage 2: understand the video. source.mp4 -> depth/NNNNNN.png and scene.json
+"""Stage 2: understand the video. source.mp4 -> scene.json
 
-Every frame gets a clean depth map with the people erased from it. scene.json holds, in metres
-and in the camera's own space, the 3D joints of every tracked person, plus the scale that turns
-each shot's depth frames into metres.
+scene.json describes the white model in metres, in the camera's own space (x right, y forward,
+z up): for every frame the box room that stands in for the set, and the 3D joints of every
+tracked person.
 
 Run as its own process so GPU memory is released before Blender starts:
     python -m pipeline.analyse JOB_DIR
@@ -10,14 +10,14 @@ Run as its own process so GPU memory is released before Blender starts:
 import json
 import subprocess
 import sys
+from fractions import Fraction
 from pathlib import Path
 
-import cv2
 import numpy as np
 import torch
 
 from . import depth as dp
-from . import figures
+from . import figures, room
 from .config import tool
 from .media import probe
 
@@ -81,9 +81,8 @@ def shot_figures(people, width, height):
                 joints.append(None)
                 continue
             kp, z = pose["kp"], pose["z"] * (scale or 1.0)
-            # Blender camera space: x right, y up, looking down -z.
-            cam = np.stack([(kp[:, 0] - width / 2) / focal * z, -(kp[:, 1] - height / 2) / focal * z,
-                            np.full(len(kp), -z)], axis=1)
+            cam = np.stack([(kp[:, 0] - width / 2) / focal * z, np.full(len(kp), z),
+                            -(kp[:, 1] - height / 2) / focal * z], axis=1)
             seen = kp[:, 2] >= figures.MIN_KEYPOINT
             joints.append([p if ok else None for p, ok in zip(np.round(cam, 4).tolist(), seen)])
             if seen[5] and seen[6]:
@@ -108,12 +107,10 @@ def main(job_dir):
 
     find_people = figures.PoseEstimator(device)
     estimate = dp.DepthEstimator(device)
-    out_dir = job_dir / "depth"
-    out_dir.mkdir(exist_ok=True)
-    people, medians, batch, previous, depth_width = [], [], [], None, 0
+    people, fits, medians, batch, previous = [], [], [], [], None
 
     def flush():
-        nonlocal previous, depth_width
+        nonlocal previous
         for frame, found in zip(batch, find_people(batch)):
             i = len(people)
             depth = estimate(frame)
@@ -123,10 +120,8 @@ def main(job_dir):
             sy, sx = depth.shape[0] / height, depth.shape[1] / width
             for person in sorted(found, key=lambda p: -p["box"][3]):     # nearest (lowest feet) first
                 person["z"] = dp.lift_out(depth, person, sx, sy)
-            depth = dp.sharpen_edges(depth, frame)
+            fits.append(room.fit(depth, LENS / 36.0))
             medians.append(float(np.median(depth)))
-            depth_width = depth.shape[1]
-            cv2.imwrite(str(out_dir / f"{i + 1:06d}.png"), dp.encode(depth))
             people.append(found)
         batch.clear()
 
@@ -137,7 +132,8 @@ def main(job_dir):
     if batch:
         flush()
 
-    shots, all_figures = [], []
+    shots, all_figures, rooms = [], [], {key: [] for key in ("theta", *room.KEYS)}
+    fps = float(Fraction(meta["fps"]))
     for s, e in zip(cuts, cuts[1:] + [len(people)]):
         scale, figs = shot_figures(people[s:e], width, height)
         if scale is None:       # nobody to measure against: put the typical surface at a set distance
@@ -145,9 +141,17 @@ def main(job_dir):
             for f in figs:
                 f["size"] *= scale
                 f["joints"] = [j and [p and [c * scale for c in p] for p in j] for j in f["joints"]]
-        shots.append({"start": s + 1, "end": e, "scale": float(scale)})     # Blender frames start at 1
+        shots.append({"start": s + 1, "end": e})     # Blender frames start at 1
+        shot_room = room.smooth(fits[s:e], scale, fps)
+        per_frame = [[] for _ in range(e - s)]
+        for f in figs:
+            for i, pose in enumerate(f["joints"], f["start"]):
+                per_frame[i] += [p for p in pose or [] if p]
+        room.contain(shot_room, [np.array(pts, dtype=float).reshape(-1, 3) for pts in per_frame], fps)
+        for key, series in shot_room.items():
+            rooms[key] += series if series is not None else [None] * (e - s)
         all_figures += [{**f, "start": f["start"] + s + 1} for f in figs]
-    scene = {"lens": LENS, "near": dp.NEAR, "depth_width": depth_width, "frames": len(people), "shots": shots, "figures": all_figures}
+    scene = {"lens": LENS, "frames": len(people), "shots": shots, "room": rooms, "figures": all_figures}
     (job_dir / "scene.json").write_text(json.dumps(scene), encoding="utf-8")
     print(f"analyse: {len(people)} frames, {len(shots)} shot(s), {len(all_figures)} figure(s) on {device}")
 
