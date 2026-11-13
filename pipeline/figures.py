@@ -1,10 +1,12 @@
 """People for the white model: detect persons, estimate their 2D pose, follow them across frames."""
 import numpy as np
 import torch
-from transformers import AutoProcessor, RTDetrForObjectDetection, VitPoseForPoseEstimation
+from transformers import (AutoProcessor, RTDetrForObjectDetection, Sam2Model, Sam2Processor,
+                          VitPoseForPoseEstimation)
 
 DETECTOR = "PekingU/rtdetr_r50vd_coco_o365"   # Apache-2.0
 POSE = "usyd-community/vitpose-base-simple"   # Apache-2.0, 17 COCO keypoints
+SEGMENTER = "facebook/sam2.1-hiera-small"     # Apache-2.0
 MIN_PERSON_SCORE = 0.35
 MIN_KEYPOINT = 0.35   # keypoints scored below this are treated as not visible
 MIN_HEIGHT = 0.15     # ignore people shorter than this fraction of the frame height
@@ -46,6 +48,26 @@ class PoseEstimator:
                     kp = np.concatenate([p["keypoints"].cpu().numpy(), p["scores"].cpu().numpy()[:, None]], axis=1)
                     people[i].append({"box": b.tolist(), "kp": kp})
         return people
+
+
+class Segmenter:
+    """Exact outline of each detected person (SAM 2, prompted with the person's box)."""
+
+    def __init__(self, device):
+        self.device = device
+        self.proc = Sam2Processor.from_pretrained(SEGMENTER)
+        self.model = Sam2Model.from_pretrained(SEGMENTER).to(device).eval()
+
+    def __call__(self, frame, people):
+        """Adds a boolean "mask" (frame-sized) to every person in the list."""
+        if not people:
+            return
+        inputs = self.proc(images=frame, input_boxes=[[p["box"] for p in people]], return_tensors="pt").to(self.device)
+        with torch.inference_mode():
+            out = self.model(**inputs, multimask_output=False)
+        masks = np.asarray(self.proc.post_process_masks(out.pred_masks.cpu(), inputs["original_sizes"])[0])
+        for person, mask in zip(people, masks.reshape(len(people), -1, *frame.shape[:2])[:, 0]):
+            person["mask"] = mask.astype(bool)
 
 
 def _iou(a, b):

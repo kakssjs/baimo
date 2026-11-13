@@ -2,6 +2,7 @@
 import json
 import re
 import uuid
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -37,6 +38,20 @@ def create_job(input_name):
 
 def fail(d, message):
     _save(d, {**load(d), "stage": "failed", "error": message})
+
+
+def pack_scene(d):
+    """Build scene.zip (the .blend plus the depth frames it points at) if it is not there yet.
+    It can be hundreds of megabytes, so it is only made when someone asks for it."""
+    target = d / "scene.zip"
+    if not target.exists() and (d / "scene.blend").exists():
+        partial = d / "scene.zip.part"
+        with zipfile.ZipFile(partial, "w", zipfile.ZIP_STORED) as z:    # PNGs are already compressed
+            z.write(d / "scene.blend", "scene.blend")
+            for png in sorted((d / "depth").glob("*.png")):
+                z.write(png, f"depth/{png.name}")
+        partial.replace(target)
+    return target
 
 
 def process(d, src, crop=None):

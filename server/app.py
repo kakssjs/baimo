@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pipeline import job
 from pipeline.config import JOBS, LIMITS, ROOT
 
-DOWNLOADS = ("final.mp4", "white.mp4", "source.mp4", "scene.blend")
+DOWNLOADS = ("final.mp4", "white.mp4", "source.mp4", "scene.zip")
 CHUNK = 1 << 20
 
 _queue = queue.Queue()
@@ -90,7 +90,8 @@ def get_job(job_id: str):
 
 @app.get("/api/jobs/{job_id}/files/{name}")
 def get_file(job_id: str, name: str):
-    path = _find(job_id) / name
+    d = _find(job_id)
+    path = job.pack_scene(d) if name == "scene.zip" else d / name
     if name not in DOWNLOADS or not path.exists():
         raise HTTPException(404, "File not found.")
     return FileResponse(path)

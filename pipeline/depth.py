@@ -1,4 +1,4 @@
-"""Depth for single frames (Depth Anything 3, monocular) and removal of people from it."""
+"""Depth for single frames (Depth Anything 3, monocular) and the clean-up applied to it."""
 import sys
 import types
 
@@ -6,11 +6,12 @@ import cv2
 import numpy as np
 import torch
 
-from . import figures
 from .config import DA3_SRC
 
 MODEL = "depth-anything/DA3MONO-LARGE"  # Apache-2.0
-PROCESS_RES = 756      # long side the model works at; depth maps come back at this size
+PROCESS_PIXELS = 420_000   # area the model works at; time per frame grows with it
+MAX_RES = 1008             # ... but never more than this on the long side
+NEAR = 0.2             # depth (model units) that maps to white in the stored 16-bit frames
 
 
 class DepthEstimator:
@@ -28,7 +29,9 @@ class DepthEstimator:
     def __call__(self, frame):
         """frame: HxWx3 uint8. Returns relative depth (h, w) float32, larger = farther."""
         with torch.inference_mode():
-            p = self.model.inference([frame], process_res=PROCESS_RES)
+            h, w = frame.shape[:2]
+            res = min(MAX_RES, int((PROCESS_PIXELS * max(w, h) / min(w, h)) ** 0.5))
+            p = self.model.inference([frame], process_res=res)
         depth = np.maximum(p.depth[0].astype(np.float32), 1e-3)
         sky = getattr(p, "sky", None)
         if sky is not None and sky[0].any() and not sky[0].all():
@@ -36,41 +39,52 @@ class DepthEstimator:
         return depth
 
 
-def lift_out(depth, person, sx, sy):
-    """Return a person's depth and erase them from the depth map, so the set behind them is
-    what gets built and a figure can stand in their place.
+def sharpen_edges(depth, frame):
+    """Guided filter: snaps the depth map's soft edges onto the edges of the video frame, and
+    smooths the surfaces in between. Works on inverse depth, guided by the frame's brightness."""
+    h, w = depth.shape
+    guide = cv2.cvtColor(cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA), cv2.COLOR_RGB2GRAY)
+    guide = guide.astype(np.float32) / 255.0
+    src = 1.0 / depth
+    k = (13, 13)
+    mean_g, mean_s = cv2.blur(guide, k), cv2.blur(src, k)
+    var_g = cv2.blur(guide * guide, k) - mean_g * mean_g
+    cov = cv2.blur(guide * src, k) - mean_g * mean_s
+    a = cov / (var_g + 8e-3)
+    b = mean_s - a * mean_g
+    out = cv2.blur(a, k) * guide + cv2.blur(b, k)
+    return 1.0 / np.clip(out, 1.0 / depth.max(), 1.0 / depth.min())
 
-    Inside the person's box, each row gets a baseline running straight from the surface left of
-    the box to the surface right of it; whatever stands out in front of that baseline is pressed
-    back onto it.
+
+def lift_out(depth, people):
+    """Erase people from a depth map and return each person's own depth.
+
+    people: the frame's detections, each with a full-frame boolean "mask" (removed here).
+    Every masked pixel is repainted from the surfaces around it, so the set shows what is
+    behind the person and a figure can stand in their place.
     """
     h, w = depth.shape
-    x0, y0, x1, y1 = person["box"]
-    px, py = 0.1 * (x1 - x0), 0.06 * (y1 - y0)
-    xa, xb = max(int((x0 - px) * sx), 0), min(int((x1 + px) * sx) + 1, w)
-    ya, yb = max(int((y0 - py) * sy), 0), min(int((y1 + py) * sy) + 1, h)
-    region = depth[ya:yb, xa:xb]
-    if region.size == 0:
-        return float(np.median(depth))
-    body = [depth[int(np.clip(y * sy, 0, h - 1)), int(np.clip(x * sx, 0, w - 1))]
-            for x, y, score in person["kp"][[5, 6, 11, 12]] if score >= figures.MIN_KEYPOINT]
-    z = float(np.median(body)) if body else float(np.percentile(region, 25))
+    gone = np.zeros((h, w), dtype=np.uint8)
+    depths = []
+    for person in people:
+        mask = cv2.resize(person.pop("mask").astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+        inside = depth[mask.astype(bool)]
+        depths.append(float(np.median(inside)) if inside.size else float(np.median(depth)))
+        gone |= mask
+    if gone.any():
+        # Depth maps blur a little past the outline, so the hole is widened before filling.
+        gone = cv2.dilate(gone, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
+        if gone.all():
+            return depths
+        inv = 1.0 / depth
+        lo, hi = float(inv.min()), float(inv.max())
+        scaled = ((inv - lo) / max(hi - lo, 1e-9) * 65535).astype(np.uint16)
+        filled = cv2.inpaint(scaled, gone, 5, cv2.INPAINT_TELEA).astype(np.float32) / 65535 * (hi - lo) + lo
+        smooth = cv2.GaussianBlur(filled, (0, 0), 3)
+        depth[gone.astype(bool)] = 1.0 / np.maximum(smooth[gone.astype(bool)], 1e-6)
+    return depths
 
-    def edge(x):    # the column just outside the box, steadied vertically; None at the frame edge
-        if not 0 <= x < w:
-            return None
-        return cv2.medianBlur(np.ascontiguousarray(depth[ya:yb, x:x + 1]), 5)[:, 0] if yb - ya >= 5 else depth[ya:yb, x]
 
-    left, right = edge(xa - 1), edge(xb)
-    if left is None and right is None:      # the box spans the frame: fall back to its far side
-        left = right = np.full(yb - ya, np.percentile(region, 90), dtype=np.float32)
-    left, right = (right if left is None else left), (left if right is None else right)
-    t = np.linspace(0, 1, xb - xa, dtype=np.float32)
-    baseline = left[:, None] * (1 - t) + right[:, None] * t
-    mask = np.zeros((h, w), dtype=np.uint8)
-    mask[ya:yb, xa:xb] = region < 0.97 * baseline
-    np.copyto(region, baseline, where=region < 0.97 * baseline)
-    # Soften the patch and its seam.
-    mask = cv2.dilate(mask, np.ones((9, 9), np.uint8)).astype(bool)
-    depth[mask] = cv2.GaussianBlur(depth, (0, 0), 4)[mask]
-    return z
+def encode(depth):
+    """16-bit image of inverse depth: white = NEAR, black = infinitely far."""
+    return (np.clip(NEAR / depth, 0, 1) * 65535).astype(np.uint16)

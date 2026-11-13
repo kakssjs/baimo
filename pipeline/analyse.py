@@ -1,8 +1,8 @@
-"""Stage 2: understand the video. source.mp4 -> scene.json
+"""Stage 2: understand the video. source.mp4 -> depth/NNNNNN.png and scene.json
 
-scene.json describes the white model in metres, in the camera's own space (x right, y forward,
-z up): for every frame the box room that stands in for the set, and the 3D joints of every
-tracked person.
+Every frame gets a clean depth map with the people erased from it; Blender shapes the set from
+those. scene.json holds, in metres and in the camera's own space (x right, y forward, z up),
+the 3D joints of every tracked person and the scale that turns each shot's depth into metres.
 
 Run as its own process so GPU memory is released before Blender starts:
     python -m pipeline.analyse JOB_DIR
@@ -10,14 +10,14 @@ Run as its own process so GPU memory is released before Blender starts:
 import json
 import subprocess
 import sys
-from fractions import Fraction
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 
 from . import depth as dp
-from . import figures, room
+from . import figures
 from .config import tool
 from .media import probe
 
@@ -106,22 +106,27 @@ def main(job_dir):
         raise RuntimeError("Could not decode frames from source.mp4.")
 
     find_people = figures.PoseEstimator(device)
+    outline = figures.Segmenter(device)
     estimate = dp.DepthEstimator(device)
-    people, fits, medians, batch, previous = [], [], [], [], None
+    out_dir = job_dir / "depth"
+    out_dir.mkdir(exist_ok=True)
+    people, medians, batch, previous, depth_width = [], [], [], None, 0
 
     def flush():
-        nonlocal previous
+        nonlocal previous, depth_width
         for frame, found in zip(batch, find_people(batch)):
             i = len(people)
             depth = estimate(frame)
             if previous is not None and i not in cuts and previous.shape == depth.shape:
                 depth = SMOOTH * previous + (1 - SMOOTH) * depth
             previous = depth.copy()
-            sy, sx = depth.shape[0] / height, depth.shape[1] / width
-            for person in sorted(found, key=lambda p: -p["box"][3]):     # nearest (lowest feet) first
-                person["z"] = dp.lift_out(depth, person, sx, sy)
-            fits.append(room.fit(depth, LENS / 36.0))
+            outline(frame, found)
+            for person, z in zip(found, dp.lift_out(depth, found)):
+                person["z"] = z
+            depth = dp.sharpen_edges(depth, frame)
             medians.append(float(np.median(depth)))
+            depth_width = depth.shape[1]
+            cv2.imwrite(str(out_dir / f"{i + 1:06d}.png"), dp.encode(depth))
             people.append(found)
         batch.clear()
 
@@ -132,8 +137,7 @@ def main(job_dir):
     if batch:
         flush()
 
-    shots, all_figures, rooms = [], [], {key: [] for key in ("theta", *room.KEYS)}
-    fps = float(Fraction(meta["fps"]))
+    shots, all_figures = [], []
     for s, e in zip(cuts, cuts[1:] + [len(people)]):
         scale, figs = shot_figures(people[s:e], width, height)
         if scale is None:       # nobody to measure against: put the typical surface at a set distance
@@ -141,17 +145,10 @@ def main(job_dir):
             for f in figs:
                 f["size"] *= scale
                 f["joints"] = [j and [p and [c * scale for c in p] for p in j] for j in f["joints"]]
-        shots.append({"start": s + 1, "end": e})     # Blender frames start at 1
-        shot_room = room.smooth(fits[s:e], scale, fps)
-        per_frame = [[] for _ in range(e - s)]
-        for f in figs:
-            for i, pose in enumerate(f["joints"], f["start"]):
-                per_frame[i] += [p for p in pose or [] if p]
-        room.contain(shot_room, [np.array(pts, dtype=float).reshape(-1, 3) for pts in per_frame], fps)
-        for key, series in shot_room.items():
-            rooms[key] += series if series is not None else [None] * (e - s)
+        shots.append({"start": s + 1, "end": e, "scale": float(scale)})     # Blender frames start at 1
         all_figures += [{**f, "start": f["start"] + s + 1} for f in figs]
-    scene = {"lens": LENS, "frames": len(people), "shots": shots, "room": rooms, "figures": all_figures}
+    scene = {"lens": LENS, "near": dp.NEAR, "depth_width": depth_width, "frames": len(people),
+             "shots": shots, "figures": all_figures}
     (job_dir / "scene.json").write_text(json.dumps(scene), encoding="utf-8")
     print(f"analyse: {len(people)} frames, {len(shots)} shot(s), {len(all_figures)} figure(s) on {device}")
 

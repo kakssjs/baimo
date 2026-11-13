@@ -82,15 +82,15 @@ def output_size(meta):
 
 
 def analyse(job_dir):
-    """Stage 2: write scene.json for source.mp4 (separate process, see analyse.py)."""
+    """Stage 2: write depth/NNNNNN.png and scene.json for source.mp4 (separate process, see analyse.py)."""
     _run([sys.executable, "-m", "pipeline.analyse", str(job_dir)], cwd=ROOT)
 
 
 def build_scene(job_dir, meta):
-    """Stage 3: build scene.blend: a box room for the set plus a figure per person."""
+    """Stage 3: build scene.blend: the set surface driven by the depth frames plus a figure per person."""
     job_dir = Path(job_dir)
     _run([tool("blender"), "-b", *BLENDER_FLAGS, "-P", str(BLENDER_SCRIPTS / "build_scene.py"), "--",
-          "--scene", str(job_dir / "scene.json"),
+          "--scene", str(job_dir / "scene.json"), "--depth-dir", str(job_dir / "depth"),
           "--width", str(meta["width"]), "--height", str(meta["height"]),
           "--whitebox", WHITEBOX_SCRIPTS, "--out", str(job_dir / "scene.blend")])
 
