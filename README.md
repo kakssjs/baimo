@@ -78,9 +78,11 @@ A local website that turns a video into a comparison film:
   frame, or overlapping someone else so that it boxes them together) can get no figure.
   Someone mostly hidden behind another person can be placed too near, and someone going down
   onto all fours can be shown kneeling for a second or so before their figure crawls. Someone
-  in mid-air (a leap off a roof) is placed on what is below them, so their figure comes out too
-  big. A person who comes back after a cut, or after more than 48 frames out of sight, becomes a
-  new figure.
+  in mid-air (a leap over a water tower) is placed as deep as what is below them. In fast,
+  blurred footage something that is not a person (the edge of a building) can get a figure for a
+  moment, and someone who appears next to it can carry on as that figure, which then jumps across
+  to them. A person who comes back after a cut, or after more than 48 frames out of sight,
+  becomes a new figure.
 - One video is processed at a time. Limits: 200 MB, 60 seconds, 1920×1080 (portrait allowed).
 - It is built for one machine and one user: no accounts, so anyone who can open the site sees
   every video.

@@ -189,7 +189,9 @@ correlates with the one before it; nothing is carried across a cut.
   torso's length, else the shoulders' width): one person's alone can mislead, as someone
   crawling side on looks narrow. The size is taken high (the 75th percentile), since
   foreshortening only ever makes a body look smaller, and in the fit a body grows more
-  readily than it shrinks: where its box is short for its size, it folds instead.
+  readily than it shrinks: where its box is short for its size, it folds instead. It grows by
+  a quarter at most, about as far as foreshortening explains: frames that are not that person
+  (a false detection joined onto their track) can otherwise call for a figure twice the size.
 - **On the floor.** The band just below a person's box (1% to 5% of the frame's height down)
   shows what they stand on. Where it is the floor (no nearer than 80% of their depth), their
   feet are at the box's bottom and they stand on the set there: on the set as the frame's camera
@@ -378,7 +380,7 @@ the look.
 | Which detections count (confidence, minimum size) | `MIN_PERSON_SCORE`, `MIN_HEIGHT` in `pipeline/figures.py` |
 | Which tracks count, and when two tracks are one person | `MIN_TRACK`, `TRACK_SCORE`, `TRACK_KEYPOINTS`, `MAX_GAP`, `STITCH_GAP`, `STITCH_REACH`, `SAME_TRACK`, `SAME_POSE`, `SAME_PART` in `pipeline/figures.py` |
 | Which keypoints the figures follow | `MIN_SCORE` in `pipeline/mannequin.py` |
-| Where figures stand, and how firmly they keep their size and depth | `OPEN_EDGE`, `BELOW`, `OCCLUDER`, `BRINK`, `GROUND_SPAN`, `GROUND_STEADY`, `FLOOR_SPAN`, `TOUCH`, `NEARER` in `pipeline/analyse.py`; `FLOOR_SLACK`, `HOLD_GROW`, `HOLD_SHRINK`, `BRIDGED`, `DEPTH_LOOSE`, `DEPTH_FIRM` in `pipeline/mannequin.py` |
+| Where figures stand, and how firmly they keep their size and depth | `OPEN_EDGE`, `BELOW`, `OCCLUDER`, `BRINK`, `GROUND_SPAN`, `GROUND_STEADY`, `FLOOR_SPAN`, `TOUCH`, `NEARER` in `pipeline/analyse.py`; `FLOOR_SLACK`, `HOLD_GROW`, `HOLD_SHRINK`, `GROW_LIMIT`, `BRIDGED`, `DEPTH_LOOSE`, `DEPTH_FIRM` in `pipeline/mannequin.py` |
 | When a figure starts out on all fours, and which way it faces | `CRAWL`, `CRAWL_SPAN`, `FACING` in `pipeline/mannequin.py` |
 | Figure proportions and part sizes | `HEIGHT`, `TORSO`, `LIMBS`, `PART_SIZES`, `TORSO_CENTRE`, `LIMB_PARTS` in `pipeline/mannequin.py` |
 | Figure, visor and set colours; bevel; which set squares become one face | `FIGURE_COLOUR`, `VISOR_COLOUR`, `SET_COLOUR`, `BEVEL`, `BLOCK`, `FLAT`, `CREASE`, `EDGE_ON`, `BACK`, `LEDGE`, `LEDGE_GAP` in `pipeline/blender/build_scene.py` |
@@ -479,8 +481,20 @@ hands over to the next.
   - In the corridor the floor under people is found in only one frame.
   - In the rooftop clip the numbers mean little: the camera turns fast and the performer is
     mostly in mid-air.
-- **Nothing else changed for the worse.** The studio, corridor and rooftop frames match the
-  previous version.
+- **No figure outgrows its shot.** In the rooftop clip a blurred building edge, taken for a
+  person, was joined onto the leaping performer's track. Filling its tall box at the depth of
+  the street below made his figure 2.3 times the size the shot's people share: a giant torso and
+  head over the water tower for about two seconds. With the size limit it is 1.25 times, about
+  his size in the picture, and it spreads its arms as he does. Three other figures were over
+  the limit, and all three still fill their person's outline:
+  - a far walker in the studio lot, 1.6 times before and 1.24 now;
+  - the man close to the camera in the corridor, 1.29 times before and 1.17 now;
+  - one more in the studio lot, 1.26 times before and 1.22 now.
+
+  In the hall no figure changes size, and its frames render as before (seven sampled frames
+  differ by half a grey level on average), so the website run above still stands.
+- **Nothing else changed in the picture.** Apart from the leap, the sampled frames of the
+  rooftop, studio and corridor clips match the previous version.
 - **The website's result matches the command line's.** At eight frames, the man on the stairs
   walks on the steps there too.
 - **Sets:** no part of any set is more than 37 m from its camera. The largest jump where one set
@@ -536,9 +550,13 @@ Not verified:
   all fours is shown kneeling until their box says otherwise, and someone crawling straight at
   the camera can stay kneeling. For someone mostly hidden behind another person, the depth
   model's depth can be the two blurred together, so their figure can stand too near.
-- **Someone in mid-air is taken to stand on what is below them.** A leap above a roof is placed
-  as deep as the roof, so the figure comes out too big and turned towards the camera. In the
-  rooftop test clip that lasts about two seconds, at about twice the size.
+- **Someone in mid-air is taken to stand on what is below them.** A leap above a water tower is
+  placed as deep as the tower.
+- **Fast, blurred footage can hold false detections.** In the rooftop test clip, the blurred
+  edge of a building is taken for a person for 18 frames (0.6 s) and gets a figure at the
+  frame's edge. The performer, who reappears next to it, carries on as that figure, so his
+  figure starts at the frame's edge and jumps across to him. His size no longer follows it (see
+  section 8).
 - **Scale and lens are estimates**, so distances in the `.blend` are approximate.
 - One job at a time; no progress percentage inside a stage; no accounts, so anyone who can open
   the site sees and can delete every job; Blender/ffmpeg error text includes server paths.

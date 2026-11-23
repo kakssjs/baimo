@@ -33,6 +33,9 @@ MIN_SCORE = 0.3     # keypoints scored lower are ignored
 FLOOR_SLACK = 0.03  # the joints may reach this share of the box's height below its floor line
 HOLD_GROW, HOLD_SHRINK = 5.0, 50.0  # how firmly the body keeps its size: foreshortening only ever makes a body
                                     # look smaller, so it grows more readily than it shrinks (it folds instead)
+GROW_LIMIT = 1.25   # ... but only as far as foreshortening explains: never beyond this share of its size (frames
+                    # that are not the person, a false detection joined onto their track, can call for a body twice
+                    # as big at the depth of what is under them)
 CRAWL = 0.6         # a box less tall than this share of the body's height, and wider than tall, holds someone
                     # on all fours seen side on: the body starts out lying along it, head first where the face is
 CRAWL_SPAN = 9      # frames over which that is decided (the middle one's neighbours all have a say)
@@ -134,7 +137,7 @@ def sizes(track, focal, width, height):
 
 def fit(track, focal, width, height, device, scale=None):
     """Fit the mannequin to one track, of about the given scale (by default what its keypoints
-    say: see sizes).
+    say: see sizes) and at most GROW_LIMIT times it.
 
     track: list over the track's frames of {"kp": 17x3 (x, y, score) or None, "box": [x0,y0,x1,y1],
            "z": depth of the person, "grounded": whether that is where the set lies under their
@@ -262,6 +265,7 @@ def fit(track, focal, width, height, device, scale=None):
         u0 = hanging(_rotation(r))
     u = u0.clone().requires_grad_()
     log_s = torch.tensor(np.log(s0), device=dev, dtype=dt, requires_grad=True)
+    largest = float(np.log(s0 * GROW_LIMIT))
 
     obs = T(kp[:, :, :2])
     weight = T(np.where(good, kp[:, :, 2], 0.0))
@@ -327,6 +331,8 @@ def fit(track, focal, width, height, device, scale=None):
         loss.backward()
         opt.step()
         sched.step()
+        with torch.no_grad():
+            log_s.clamp_(max=largest)       # (never bigger than GROW_LIMIT allows)
     with torch.no_grad():
         s = log_s.exp()
         R = _rotation(r)
