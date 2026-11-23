@@ -41,15 +41,13 @@ def fail(d, message):
 
 
 def pack_scene(d):
-    """Build scene.zip (the .blend plus the depth frames it points at) if it is not there yet.
-    It can be hundreds of megabytes, so it is only made when someone asks for it."""
+    """Build scene.zip (the .blend, which holds the whole scene) if it is not there yet. It can be
+    large, so it is only made when someone asks for it."""
     target = d / "scene.zip"
     if not target.exists() and (d / "scene.blend").exists():
         partial = d / "scene.zip.part"
-        with zipfile.ZipFile(partial, "w", zipfile.ZIP_STORED) as z:    # PNGs are already compressed
+        with zipfile.ZipFile(partial, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as z:
             z.write(d / "scene.blend", "scene.blend")
-            for png in sorted((d / "depth").glob("*.png")):
-                z.write(png, f"depth/{png.name}")
         partial.replace(target)
     return target
 

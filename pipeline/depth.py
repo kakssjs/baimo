@@ -1,4 +1,4 @@
-"""Depth for single frames (Depth Anything 3, monocular) and the clean-up applied to it."""
+"""Depth for single frames (Depth Anything 3, monocular), and where they are too dark for it."""
 import sys
 import types
 
@@ -9,9 +9,27 @@ import torch
 from .config import DA3_SRC
 
 MODEL = "depth-anything/DA3MONO-LARGE"  # Apache-2.0
-PROCESS_PIXELS = 420_000   # area the model works at; time per frame grows with it
-MAX_RES = 1008             # ... but never more than this on the long side
-NEAR = 0.2             # depth (model units) that maps to white in the stored 16-bit frames
+RES = 1008             # long side the model works at (fine detail for crisp set edges)
+DARK = 16              # mean brightness (0..255) below which a frame is too dark for the model to read
+UNLIT = 10             # parts of a frame darker than this (0..255, over 2% of its width) and nearly even
+UNLIT_EVEN = 4         # (brightness spread below this) show nothing the model can read: it makes up depth
+UNLIT_MIN = 0.01       # there (a dark room behind someone, the far end of a tunnel); none smaller than this
+                       # share of the frame
+
+
+def unlit(frame, shape):
+    """Where frame (HxWx3 uint8, RGB) is too dark to see anything, at the depth model's working
+    size shape ((h, w) bool): large patches nearly black and nearly even (see UNLIT)."""
+    h, w = shape
+    luma = cv2.cvtColor(cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA), cv2.COLOR_RGB2GRAY).astype(np.float32)
+    k = max(3, round(0.02 * w) | 1)
+    mean = cv2.blur(luma, (k, k))
+    spread = np.sqrt(np.maximum(cv2.blur(luma * luma, (k, k)) - mean * mean, 0))
+    m = cv2.morphologyEx(((mean < UNLIT) & (spread < UNLIT_EVEN)).astype(np.uint8), cv2.MORPH_OPEN, np.ones((k, k), np.uint8))
+    n, cc, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    big = stats[:, cv2.CC_STAT_AREA] >= UNLIT_MIN * h * w
+    big[0] = False
+    return big[cc]
 
 
 class DepthEstimator:
@@ -27,64 +45,13 @@ class DepthEstimator:
         self.model = DepthAnything3.from_pretrained(MODEL).to(device).eval()
 
     def __call__(self, frame):
-        """frame: HxWx3 uint8. Returns relative depth (h, w) float32, larger = farther."""
+        """frame: HxWx3 uint8. Returns depth ((h, w) float32, larger = farther, at the model's
+        working size, which covers the whole frame) and where the sky is ((h, w) bool)."""
         with torch.inference_mode():
-            h, w = frame.shape[:2]
-            res = min(MAX_RES, int((PROCESS_PIXELS * max(w, h) / min(w, h)) ** 0.5))
-            p = self.model.inference([frame], process_res=res)
+            p = self.model.inference([frame], process_res=RES)
         depth = np.maximum(p.depth[0].astype(np.float32), 1e-3)
         sky = getattr(p, "sky", None)
-        if sky is not None and sky[0].any() and not sky[0].all():
-            depth[sky[0]] = 2.0 * np.percentile(depth[~sky[0]], 99)   # sky has no depth: push it far back
-        return depth
-
-
-def sharpen_edges(depth, frame):
-    """Guided filter: snaps the depth map's soft edges onto the edges of the video frame, and
-    smooths the surfaces in between. Works on inverse depth, guided by the frame's brightness."""
-    h, w = depth.shape
-    guide = cv2.cvtColor(cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA), cv2.COLOR_RGB2GRAY)
-    guide = guide.astype(np.float32) / 255.0
-    src = 1.0 / depth
-    k = (13, 13)
-    mean_g, mean_s = cv2.blur(guide, k), cv2.blur(src, k)
-    var_g = cv2.blur(guide * guide, k) - mean_g * mean_g
-    cov = cv2.blur(guide * src, k) - mean_g * mean_s
-    a = cov / (var_g + 8e-3)
-    b = mean_s - a * mean_g
-    out = cv2.blur(a, k) * guide + cv2.blur(b, k)
-    return 1.0 / np.clip(out, 1.0 / depth.max(), 1.0 / depth.min())
-
-
-def lift_out(depth, people):
-    """Erase people from a depth map and return each person's own depth.
-
-    people: the frame's detections, each with a full-frame boolean "mask" (removed here).
-    Every masked pixel is repainted from the surfaces around it, so the set shows what is
-    behind the person and a figure can stand in their place.
-    """
-    h, w = depth.shape
-    gone = np.zeros((h, w), dtype=np.uint8)
-    depths = []
-    for person in people:
-        mask = cv2.resize(person.pop("mask").astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
-        inside = depth[mask.astype(bool)]
-        depths.append(float(np.median(inside)) if inside.size else float(np.median(depth)))
-        gone |= mask
-    if gone.any():
-        # Depth maps blur a little past the outline, so the hole is widened before filling.
-        gone = cv2.dilate(gone, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
-        if gone.all():
-            return depths
-        inv = 1.0 / depth
-        lo, hi = float(inv.min()), float(inv.max())
-        scaled = ((inv - lo) / max(hi - lo, 1e-9) * 65535).astype(np.uint16)
-        filled = cv2.inpaint(scaled, gone, 5, cv2.INPAINT_TELEA).astype(np.float32) / 65535 * (hi - lo) + lo
-        smooth = cv2.GaussianBlur(filled, (0, 0), 3)
-        depth[gone.astype(bool)] = 1.0 / np.maximum(smooth[gone.astype(bool)], 1e-6)
-    return depths
-
-
-def encode(depth):
-    """16-bit image of inverse depth: white = NEAR, black = infinitely far."""
-    return (np.clip(NEAR / depth, 0, 1) * 65535).astype(np.uint16)
+        sky = np.zeros(depth.shape, bool) if sky is None else sky[0].astype(bool)
+        if sky.mean() > 0.95 and frame.mean() < DARK:   # all "sky" in the dark: the model could not read it
+            sky[:] = False
+        return depth, sky

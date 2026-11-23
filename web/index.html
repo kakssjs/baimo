@@ -64,9 +64,9 @@
 <main>
   <h1>Baimo</h1>
   <p class="muted">Upload a video and get it back with the original on top and a white-model version below.</p>
-  <p class="notice">Built automatically in Blender: the set becomes a white clay model shaped from
-    every frame, and each person is removed from it and replaced by a sphere-and-box figure.
-    Clear, well-lit footage gives a detailed set; dark or blurred footage gives a soft one.</p>
+  <p class="notice">Built automatically in Blender: the set becomes a crisp white clay model, with
+    walls, floors and furniture rebuilt as flat surfaces, and each person is removed from it and
+    replaced by a sphere-and-box figure. Dark or blurred footage gives a rougher set.</p>
 
   <section>
     <label id="drop">
@@ -133,7 +133,10 @@ function renderDetail() {
     parts.push(
       el("video", {src: files + "final.mp4", controls: true, playsInline: true}),
       el("p", {className: "muted"},
-         `${j.final.width}×${j.final.height}, ${j.final.duration.toFixed(1)} s`),
+         `${j.final.width}×${j.final.height}, ${j.final.duration.toFixed(1)} s` +
+         (j.source && j.source.crop
+           ? ` · made from the ${j.source.crop.split(":").slice(0, 2).join("×")} picture area of the upload`
+           : "")),
       el("div", {className: "actions"},
          el("a", {className: "btn primary", href: files + "final.mp4", download: `baimo-${j.id}.mp4`},
             "Download comparison"),

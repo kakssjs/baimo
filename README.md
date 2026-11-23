@@ -15,13 +15,38 @@ A local website that turns a video into a comparison film:
 
 - **Upload a video in the browser** and watch it move through the stages: preparing, reading
   depth and people, building the 3D scene, rendering in Blender, combining.
-- **Turn the set into a white clay model.** A large depth model reads every frame at high
-  resolution; Blender shapes a perspective surface from it, with edges snapped to the real
-  edges in the picture, and renders it with soft shadows and ambient occlusion.
+- **Use comparison videos as they are.** Black bars are cut off, and in a video that already
+  shows an original next to a render, only the filmed half is used.
+- **Turn the set into a crisp white clay model.** A large depth model reads every frame; walls,
+  floors, steps and furniture faces are rebuilt from it as flat planes with straight, sharp
+  outlines and clean corners, turned square to each other where the set is built square, so
+  the set looks built by hand; everything else (rails, lamps, radiators, coats) becomes flat
+  cards in its own outline, like the blocks a set is roughed out with. Small pieces that lie on
+  a larger surface become part of it, so the set is a few large, plain surfaces that render
+  cleanly, and only what stands out from them (a staircase, a counter, a door frame) is a piece
+  of its own. A run of stairs is rebuilt as even steps, one rise and one run, as a set builder
+  makes them. The treads of a stair and its landing, which a camera level with them sees
+  edge-on, are still there to stand on. Blender renders it with soft shadows and ambient
+  occlusion.
+- **Build the set through the dark.** Where the footage is too dark to see, the walls, floors and
+  ceilings around it carry on through it, as on a real set. Only where it opens into darkness
+  that nothing around can close (a doorway into an unlit room) is it left as a plain dark void.
+- **Move the camera through a still set, like a real one.** The camera's path through each shot
+  (where it stands and where it looks, frame by frame) is recovered from the background. The set
+  is built from the depth of many frames at once and stands still while the camera moves, turns
+  or pulls back through it: nothing in it flickers or changes shape. A long camera move is
+  covered by a few such sets, one after the other.
 - **Replace people with sphere-and-box figures.** Each person is detected, followed through the
-  shot, cut out of the set along their exact outline, and rebuilt as a 3D mannequin — sphere head, box torso, box arms
-  and legs — that copies their pose frame by frame and casts a shadow on the set. A teal visor
-  shows which way the face points. Each tracked person gets a colour.
+  shot and cut out of the set along their exact outline. The space behind them is closed with
+  the walls and floor around them, or with what other frames saw there, so no outline of them
+  stays in the set.
+- **Keep figures true to the people.** Each person becomes one 3D mannequin of fixed
+  proportions: sphere head, box torso, box arms and legs. It stands on the set where they
+  stand (on the floor, or on a stair), at their size, fills their outline from edge to edge (so
+  someone kneeling folds down rather than shrinks, and someone on all fours crawls, knees down),
+  and copies their pose and the way they face, frame by frame, with the whole body always
+  there. A teal visor shows where the face points, and the figure casts a shadow on the set.
+  Someone the detector loses for a moment, or boxes twice, stays one figure.
 - **Keep the two halves in step.** The white model lines up with the footage pixel for pixel
   and has the same frame rate and frame count.
 - **Render at a watchable size.** Small uploads are enlarged so each half is at least 1280
@@ -35,15 +60,27 @@ A local website that turns a video into a comparison film:
 
 ## What it cannot do yet
 
-- The set is one sculpted surface seen from the camera, not separate walls, floors and props,
-  and there is no recovered camera path. It cannot be walked around in Blender.
-- Figures follow poses but always face the camera; arms or legs the pose model cannot see are
-  left out.
-- A person who is lost and found again (after a cut, or when hidden) comes back as a new figure
-  with a different colour. Small or very dark people can be missed.
-- The set is a sculpted relief of what the camera sees, not hand-clean geometry: edges are
-  softer than in a hand-built white model. Dark, blurry or very low-resolution footage gives a
-  soft, lumpy set.
+- The set is built from what the camera saw, not from separate objects: what no frame saw (the
+  backs of things, the room behind the camera) is missing, so it cannot be walked around freely
+  in Blender.
+- Irregular things (coats, plants, a lamp) become flat cards in their own outline, not their
+  real shape, and dark, blurry or very low-resolution footage yields fewer, rougher planes.
+  Stairs are made even only where their risers face the camera (looking up a straight flight);
+  seen from above, or winding, they keep the planes found. What is built
+  through the dark is the surfaces around it carried on, not what is really there, and a dark
+  void is a flat backdrop with no depth.
+- Where a long camera move hands over from one set to the next, some panels shift slightly
+  over about a quarter of a second, because each set is cut into panels on its own.
+- Where a person stood, the set behind them is a reconstruction. A few small specks or a thin
+  edge can show in the wall or floor next to a figure, and a flat patch can show behind
+  someone who stays in one place or fills much of the frame.
+- People the detector is unsure of (half hidden behind a counter, very dark, mostly out of
+  frame, or overlapping someone else so that it boxes them together) can get no figure.
+  Someone mostly hidden behind another person can be placed too near, and someone going down
+  onto all fours can be shown kneeling for a second or so before their figure crawls. Someone
+  in mid-air (a leap off a roof) is placed on what is below them, so their figure comes out too
+  big. A person who comes back after a cut, or after more than 48 frames out of sight, becomes a
+  new figure.
 - One video is processed at a time. Limits: 200 MB, 60 seconds, 1920×1080 (portrait allowed).
 - It is built for one machine and one user: no accounts, so anyone who can open the site sees
   every video.
@@ -89,10 +126,13 @@ baimo/
 ├─ web/index.html     the page
 ├─ pipeline/
 │  ├─ job.py          runs the stages for one video, writes job.json
-│  ├─ media.py        ffmpeg steps and Blender launchers
-│  ├─ analyse.py      shot cuts, per-frame depth, people; writes depth frames and scene.json
-│  ├─ depth.py        depth model, person removal, edge sharpening
+│  ├─ media.py        ffmpeg steps (finding the picture area), Blender launchers
+│  ├─ analyse.py      shot cuts, the three analysis passes; writes the sets and scene.json
+│  ├─ depth.py        the depth model
+│  ├─ camera.py       the camera's path through each shot, from features on the background
+│  ├─ planes.py       the sets: depth from many frames laid together, flat surfaces, people taken out
 │  ├─ figures.py      person detection, pose estimation, outlines and tracking
+│  ├─ mannequin.py    the 3D mannequin fitted to each tracked person
 │  └─ blender/        scripts that run inside Blender (build_scene.py, render_shot.py)
 ├─ jobs/              one folder per processed video (not in git)
 ├─ WB_SmokeTest/      earlier Blender white-model experiments

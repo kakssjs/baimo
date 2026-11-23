@@ -1,12 +1,17 @@
 """Stage 3: build the white-model scene for the whole video.
 
 Run: blender -b --factory-startup --python-exit-code 1 -P build_scene.py --
-         --scene SCENE.json --depth-dir DIR --width W --height H --whitebox SCRIPTS_DIR --out SCENE.blend
+         --scene SCENE.json --sets-dir DIR --width W --height H --whitebox SCRIPTS_DIR --out SCENE.blend
 
-The scene is in metres, z up, with the camera fixed at the origin looking along +Y.
-  Set      one mesh; a Geometry Nodes modifier pushes every vertex out along its line of sight to
-           the depth stored in that frame's depth image, so it is a true perspective surface.
-  Figures  a sphere-and-box mannequin per tracked person, keyframed from 3D joints.
+The scene is in metres, z up; each shot starts with the camera at the origin looking along +Y.
+  Sets     a mesh per stretch of a shot, standing still while the camera moves through it: every
+           pixel of the set's picture (sets/NNN.npy, inverse depth seen from its keyframe) is a
+           vertex out along its line of sight, flat surfaces merged into single faces. Each is
+           shown only during its stretch, and over its last frames takes on the next one's shape.
+           What was too dark to see (-1 in the picture) is a dark, unlit backdrop behind it.
+  Figures  a sphere-and-box mannequin per tracked person: every part keeps one size throughout
+           and is placed and turned in every frame as scene.json says.
+  Camera   placed and turned in every frame as scene.json says (the camera's path in the video).
 """
 import argparse
 import json
@@ -16,11 +21,12 @@ import sys
 
 import bmesh
 import bpy
-from mathutils import Matrix, Quaternion, Vector
+import numpy as np
+from mathutils import Quaternion, Vector
 
 p = argparse.ArgumentParser()
 p.add_argument("--scene", required=True)
-p.add_argument("--depth-dir", required=True)
+p.add_argument("--sets-dir", required=True)
 p.add_argument("--width", type=int, required=True)
 p.add_argument("--height", type=int, required=True)
 p.add_argument("--whitebox", required=True)
@@ -32,14 +38,23 @@ import whitebox as wb  # noqa: E402
 
 data = json.loads(open(a.scene, encoding="utf-8").read())
 FRAMES = data["frames"]
-FAR = 1e-3              # depth-image value treated as the far limit (keeps the sky at a finite distance)
+BLOCK = 8                  # pixels: a flat square of a set's picture this size becomes one face ...
+FLAT = 1e-4                # ... where its depths lie within this share of one plane (walls, floors, steps)
+CREASE = math.radians(40)  # set surfaces folding more sharply than this are shaded as hard edges
+EDGE_ON = 0.02             # a square of a set seen this nearly edge-on from its camera (cosine) spans a gap ...
+BACK = 4                   # ... and is laid on what lies furthest back within this many pixels, unless it is
+LEDGE = 0.1                # the top of something level with the camera (a tread, a landing): near below far,
+LEDGE_GAP = 0.4            # the sight line between them at most this steeply down (tangent), and the far side
+                           # at most this share further back
+HAND_OVER = 8              # frames over which a set takes on the next one's shape before that takes over ...
+MATCH = 0.5                # ... where both show the same surface (depths this close)
+VOID_MARGIN = 0.03         # share of a set's width its dark backdrop reaches in behind the set's edges ...
+VOID_FAR = 2.0             # ... and it stands this many times as far back as the farthest of the set
 BEVEL = 0.012
-FIGURE_COLOURS = [(0.92, 0.92, 0.9), (0.88, 0.72, 0.1), (0.2, 0.62, 0.6), (0.85, 0.42, 0.15), (0.45, 0.5, 0.85)]
-VISOR_COLOUR = (0.05, 0.3, 0.32)
-LIMBS = {"Arm_Upper_L": (5, 7), "Arm_Lower_L": (7, 9), "Arm_Upper_R": (6, 8), "Arm_Lower_R": (8, 10),
-         "Leg_Upper_L": (11, 13), "Leg_Lower_L": (13, 15), "Leg_Upper_R": (12, 14), "Leg_Lower_R": (14, 16)}
-EYE = Vector((0, 0, 0))
-DOWN = Vector((0, 0, -1))
+SET_COLOUR = (0.6, 0.6, 0.6)
+VOID_COLOUR = (0.006, 0.008, 0.016)     # what was too dark to see: an empty, dark stage (shown as is, unlit)
+FIGURE_COLOUR = (0.85, 0.85, 0.84)
+VISOR_COLOUR = (0.02, 0.33, 0.35)
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
 sc = bpy.context.scene
@@ -63,94 +78,180 @@ def material(name, colour, roughness=0.65):
     return mat
 
 
-# --- set: a grid one unit in front of the camera that exactly fills the view
-image = bpy.data.images.load(os.path.join(a.depth_dir, "000001.png"))
-image.source = "SEQUENCE"
-image.colorspace_settings.name = "Non-Color"
-half_w = 18.0 / data["lens"]
-half_h = half_w * a.height / a.width
-cols = min(640, data["depth_width"] // 2)
-rows = max(2, round(cols * a.height / a.width))
-bm = bmesh.new()
-bmesh.ops.create_grid(bm, x_segments=cols, y_segments=rows, size=1.0)
-extent = max(v.co.x for v in bm.verts)
-uv = bm.loops.layers.uv.new("UVMap")
-for v in bm.verts:
-    v.co = Vector((v.co.x / extent * half_w, v.co.y / extent * half_h, -1.0))
-for face in bm.faces:
-    for loop in face.loops:
-        loop[uv].uv = (loop.vert.co.x / (2 * half_w) + 0.5, loop.vert.co.y / (2 * half_h) + 0.5)
-mesh = bpy.data.meshes.new("Set")
-bm.to_mesh(mesh)
-bm.free()
-set_ob = bpy.data.objects.new("Set", mesh)
-# The grid is laid out for a camera looking down -Z; turn it to this scene's camera (+Y forward, +Z up).
-set_ob.rotation_euler = (math.radians(90), 0, 0)
-wb.collection("WB/Set").objects.link(set_ob)
-wb.assign_clay(set_ob, material("WB_Clay", (0.72, 0.72, 0.72), roughness=0.75))
-
-# Geometry Nodes: position = position * (near / depth_image), in the depth model's own units
-tree = bpy.data.node_groups.new("WB_DepthToSurface", "GeometryNodeTree")
-tree.interface.new_socket(name="Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
-tree.interface.new_socket(name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
-new, link = tree.nodes.new, tree.links.new
+def unlit_material(name, colour):
+    """A material that shows one colour whatever the light falling on it."""
+    mat = bpy.data.materials.new(name)
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    nodes.clear()       # (built afresh: a node kept while the others are removed can be left dangling)
+    out = nodes.new("ShaderNodeOutputMaterial")
+    emit = nodes.new("ShaderNodeEmission")
+    emit.inputs["Color"].default_value = (*colour, 1.0)
+    mat.node_tree.links.new(emit.outputs[0], out.inputs["Surface"])
+    mat.diffuse_color = (*colour, 1.0)
+    return mat
 
 
-def math_node(operation, first, second):
-    node = new("ShaderNodeMath")
-    node.operation = operation
-    for socket, value in zip(node.inputs, (first, second)):
-        if isinstance(value, (int, float)):
-            socket.default_value = value
-        else:
-            link(value, socket)
-    return node.outputs[0]
+def shown(ob, start, end):
+    """Show an object only from frame start to frame end (switched, not faded)."""
+    for frame, hidden in ((start - 1, True), (start, False), (end, False), (end + 1, True)):
+        if 1 <= frame <= FRAMES:
+            ob.hide_render = ob.hide_viewport = hidden
+            ob.keyframe_insert("hide_render", frame=frame)
+            ob.keyframe_insert("hide_viewport", frame=frame)
 
 
-group_in, group_out = new("NodeGroupInput"), new("NodeGroupOutput")
-uv_attr = new("GeometryNodeInputNamedAttribute")
-uv_attr.data_type = "FLOAT_VECTOR"
-uv_attr.inputs["Name"].default_value = "UVMap"
-tex = new("GeometryNodeImageTexture")
-tex.interpolation, tex.extension = "Linear", "EXTEND"
-tex.inputs["Image"].default_value = image
-link(uv_attr.outputs["Attribute"], tex.inputs["Vector"])
-link(new("GeometryNodeInputSceneTime").outputs["Frame"], tex.inputs["Frame"])
-distance = math_node("DIVIDE", data["near"], math_node("MAXIMUM", tex.outputs["Color"], FAR))
-push = new("ShaderNodeVectorMath")
-push.operation = "SCALE"
-link(new("GeometryNodeInputPosition").outputs["Position"], push.inputs["Vector"])
-link(distance, push.inputs["Scale"])
-set_position = new("GeometryNodeSetPosition")
-link(group_in.outputs["Geometry"], set_position.inputs["Geometry"])
-link(push.outputs["Vector"], set_position.inputs["Position"])
-# Smooth surfaces, but keep a hard crease wherever the surface folds sharply (depth edges).
-smooth_faces = new("GeometryNodeSetShadeSmooth")
-link(set_position.outputs["Geometry"], smooth_faces.inputs["Geometry"])
-crease = new("GeometryNodeSetShadeSmooth")
-crease.domain = "EDGE"
-link(smooth_faces.outputs["Geometry"], crease.inputs["Geometry"])
-link(math_node("LESS_THAN", new("GeometryNodeInputMeshEdgeAngle").outputs["Unsigned Angle"], math.radians(40)),
-     crease.inputs["Shade Smooth"])
-link(crease.outputs["Geometry"], group_out.inputs["Geometry"])
+# --- sets: one mesh per stretch, in its keyframe camera's space (x right, y forward, z up)
+def set_mesh(name, q, cx, cy, focal):
+    """A set's picture (inverse depth q, > 0 where there is a surface) as a mesh: pixels are
+    vertices out along their lines of sight, the squares between them faces; a BLOCK-sized
+    square that is flat is one face. (A pixel on the edge of such a face lies on that edge, as
+    the face is flat, so no cracks open beside it.)"""
+    rows, cols = q.shape
+    q = q.astype(np.float64)
+    valid = q > 0
+    br, bc = (rows - 1) // BLOCK, (cols - 1) // BLOCK      # whole blocks; block (r, c) spans pixels
+    # r * BLOCK .. r * BLOCK + BLOCK down and c * BLOCK .. c * BLOCK + BLOCK across, edges included.
 
-modifier = set_ob.modifiers.new("Depth", "NODES")
-modifier.node_group = tree
-# The camera is at the origin, so scaling the object turns model units into metres. One scale
-# per shot, keyed at both ends so it never blends across a cut.
-for shot in data["shots"]:
-    for frame in (shot["start"], shot["end"]):
-        set_ob.scale = (shot["scale"],) * 3
-        set_ob.keyframe_insert("scale", frame=frame)
+    def at(di, dj):
+        return q[di:di + br * BLOCK:BLOCK, dj:dj + bc * BLOCK:BLOCK][:br, :bc]
+
+    q00, q01, q10, q11 = at(0, 0), at(0, BLOCK), at(BLOCK, 0), at(BLOCK, BLOCK)
+    flat = np.ones((br, bc), bool)
+    for di in range(BLOCK + 1):     # on a plane, inverse depth is linear in the pixel position
+        for dj in range(BLOCK + 1):
+            y, x = di / BLOCK, dj / BLOCK
+            v = at(di, dj)
+            plane = (1 - y) * ((1 - x) * q00 + x * q01) + y * ((1 - x) * q10 + x * q11)
+            flat &= (v > 0) & (np.abs(v - plane) <= FLAT * v)
+    # Every pixel square with a surface at all four corners, except those inside flat blocks ...
+    fine = valid[1:, :-1] & valid[1:, 1:] & valid[:-1, 1:] & valid[:-1, :-1]
+    fine[:br * BLOCK, :bc * BLOCK] &= ~np.repeat(np.repeat(flat, BLOCK, 0), BLOCK, 1)
+    i, j = np.nonzero(fine)
+    # ... and one square per flat block; corners in this order face the camera.
+    r, c = np.nonzero(flat)
+    rows_ = np.concatenate([np.stack((i + 1, i + 1, i, i), 1), np.stack((r + 1, r + 1, r, r), 1) * BLOCK])
+    cols_ = np.concatenate([np.stack((j, j + 1, j + 1, j), 1), np.stack((c, c + 1, c + 1, c), 1) * BLOCK])
+    # A square seen almost edge-on from the camera is no surface but the gap between something near
+    # and something further back (the edge of a pillar, a hanging lamp); seen from anywhere else it
+    # would be a sheet stretched across that gap. Its near corners go back onto what lies behind
+    # (copies of their vertices, so the near surface keeps its own edge), which still closes the
+    # seam as seen from the camera.
+    a00, a01, a10, a11 = q[i, j], q[i, j + 1], q[i + 1, j], q[i + 1, j + 1]
+    gx, gy = (a01 - a00 + a11 - a10) / 2, (a10 - a00 + a11 - a01) / 2    # per pixel
+    mid, x, y = (a00 + a01 + a10 + a11) / 4, j + 1 - cx, i + 1 - cy
+    # On a plane 1/z = gx x + gy y + k (x, y in pixels from the centre), the normal is (gx f, gy f, k).
+    k = mid - gx * x - gy * y
+    cos = mid / (np.sqrt((gx ** 2 + gy ** 2) * focal ** 2 + k ** 2) * np.sqrt((x ** 2 + y ** 2) / focal ** 2 + 1))
+    # Such a square stays, though, where it is the top of something the camera sees edge-on, being
+    # level with it (the treads of a stair and its landing, the top of a radiator): the near side
+    # is below the far side and the sight line between them runs level or a little down, so the
+    # square is that top, from its front edge to what stands behind it, and whoever stands there
+    # stands on it. (Seen from further above, such a top would show; further back, the far side is
+    # what lies behind a lamp or a rail.)
+    top = (gy > 2 * np.abs(gx)) & (y <= LEDGE * focal) & (
+        np.maximum.reduce([a00, a01, a10, a11]) <= (1 + LEDGE_GAP) * np.minimum.reduce([a00, a01, a10, a11]))
+    gap = np.concatenate([(cos < EDGE_ON) & ~top, np.zeros(len(r), bool)])
+    back = np.where(valid, q, np.inf)       # the furthest surface (least inverse depth) within BACK pixels
+    for axis in (0, 1):
+        pad = np.pad(back, [(BACK, BACK) if ax == axis else (0, 0) for ax in (0, 1)], constant_values=np.inf)
+        back = np.min([np.take(pad, range(s, s + q.shape[axis]), axis=axis) for s in range(2 * BACK + 1)], 0)
+    near = gap[:, None] & (q[rows_, cols_] > 1.05 * back[rows_, cols_])
+    pixel = rows_ * cols + cols_ + near * (rows * cols)     # (a copy of the pixel, laid back)
+    used, quads = np.unique(pixel, return_inverse=True)
+    copy, at_pixel = np.divmod(used, rows * cols)
+    ii, jj = np.divmod(at_pixel, cols)
+    z = 1.0 / np.where(copy > 0, back[ii, jj], q[ii, jj])
+    verts = np.stack(((jj + 0.5 - cx) / focal * z, z, -(ii + 0.5 - cy) / focal * z), axis=1)
+    me = bpy.data.meshes.new(name)
+    me.vertices.add(len(verts))
+    me.vertices.foreach_set("co", verts.astype(np.float32).ravel())
+    me.loops.add(quads.size)
+    me.loops.foreach_set("vertex_index", quads.astype(np.int32).ravel())
+    me.polygons.add(len(pixel))
+    me.polygons.foreach_set("loop_start", np.arange(0, quads.size, 4, dtype=np.int32))
+    me.update(calc_edges=True)
+    me.shade_smooth()
+    me.set_sharp_from_angle(angle=CREASE)
+    return me
 
 
-# --- figures: sphere head, box torso and limbs, placed between 3D joints
-def part_mesh(name, sphere):
+def backdrop(q):
+    """The picture of a set's dark backdrop: where the set was too dark to see (q < 0), and
+    VOID_MARGIN of its width around that in behind the set, so that no light gap opens beside it
+    as the camera moves; one flat surface facing the camera, VOID_FAR times as far back as the
+    farthest of the set. (Not behind the rest: a gap at an edge there shows the sky, which stands
+    out far less against the clay than the dark would.)"""
+    r = max(1, round(VOID_MARGIN * q.shape[1]))
+    grown = q < 0
+    for axis in (0, 1):     # (widened along one axis, then the other, by running sums)
+        n = q.shape[axis]
+        c = np.cumsum(np.pad(grown, [(r + 1, r) if a == axis else (0, 0) for a in (0, 1)]), axis=axis, dtype=np.int32)
+        grown = np.take(c, range(2 * r + 1, 2 * r + 1 + n), axis=axis) > np.take(c, range(n), axis=axis)
+    far = float(q[q > 0].min()) if (q > 0).any() else 0.2
+    return np.where(grown, far / VOID_FAR, 0.0)
+
+
+def hand_over(ob, st, nxt, q):
+    """Over the last HAND_OVER frames of its stretch, a set (object ob, scene.json entry st) takes
+    on the shape of the next set of its shot (nxt, with picture q) wherever both show the same
+    surface, so that the switch from one to the other changes next to nothing."""
+    co = np.empty(len(ob.data.vertices) * 3, np.float32)
+    ob.data.vertices.foreach_get("co", co)
+    co = co.reshape(-1, 3).astype(np.float64)
+    turn = [np.array(Quaternion(s["rot"]).to_matrix()) for s in (st, nxt)]
+    world = np.array(st["loc"]) + st["scale"] * co @ turn[0].T
+    there = (world - np.array(nxt["loc"])) @ turn[1] / nxt["scale"]       # in the next set's space
+    ahead = there[:, 1] > 1e-6
+    depth = np.where(ahead, there[:, 1], 1.0)
+    i = np.round(-there[:, 2] / depth * nxt["focal"] + nxt["cy"] - 0.5).astype(np.int64)
+    j = np.round(there[:, 0] / depth * nxt["focal"] + nxt["cx"] - 0.5).astype(np.int64)
+    inside = ahead & (i >= 0) & (i < q.shape[0]) & (j >= 0) & (j < q.shape[1])
+    qn = np.zeros(len(co))
+    qn[inside] = q[i[inside], j[inside]]
+    same = (qn > 0) & (np.abs(qn * depth - 1) < MATCH)
+    there *= np.where(same, 1.0 / np.where(same, qn * depth, 1.0), 1.0)[:, None]   # along its line of sight
+    moved = (np.array(nxt["loc"]) + nxt["scale"] * there @ turn[1].T - np.array(st["loc"])) @ turn[0] / st["scale"]
+    ob.shape_key_add(name="Basis", from_mix=False)
+    key = ob.shape_key_add(name="Next", from_mix=False)
+    key.data.foreach_set("co", np.where(same[:, None], moved, co).astype(np.float32).ravel())
+    for frame, value in ((max(st["start"], st["end"] - HAND_OVER), 0.0), (st["end"], 1.0)):
+        key.value = value
+        key.keyframe_insert("value", frame=frame)
+
+
+clay = material("WB_Clay", SET_COLOUR, roughness=0.75)
+void = unlit_material("WB_Void", VOID_COLOUR)
+sets = wb.collection("WB/Set")
+previous = None
+for number, st in enumerate(data["sets"], 1):
+    q = np.load(os.path.join(a.sets_dir, st["file"]))
+    ob = bpy.data.objects.new(f"Set_{number:03d}", set_mesh(f"Set_{number:03d}", q, st["cx"], st["cy"], st["focal"]))
+    parts = [(ob, clay)]
+    if (q < 0).any():
+        back = bpy.data.objects.new(f"Set_{number:03d}_Void", set_mesh(f"Set_{number:03d}_Void", backdrop(q),
+                                                                          st["cx"], st["cy"], st["focal"]))
+        setting(back, "visible_shadow", False)      # (it stands for nothing, so it casts nothing)
+        parts.append((back, void))
+    for part, mat in parts:
+        sets.objects.link(part)
+        wb.assign_clay(part, mat)
+        part.rotation_mode = "QUATERNION"
+        part.location, part.rotation_quaternion, part.scale = st["loc"], st["rot"], (st["scale"],) * 3
+        shown(part, st["start"], st["end"])
+    if previous and previous[1]["shot"] == st["shot"] and previous[1]["end"] + 1 == st["start"]:
+        hand_over(*previous, st, q)
+    previous = ob, st
+
+
+# --- figures: sphere head, box torso and limbs, each part one size throughout
+def part_mesh(name, size, sphere):
     bm = bmesh.new()
     if sphere:
         bmesh.ops.create_uvsphere(bm, u_segments=32, v_segments=16, radius=0.5)
     else:
         bmesh.ops.create_cube(bm, size=1.0)
+    bmesh.ops.scale(bm, vec=Vector(size), verts=bm.verts)
     me = bpy.data.meshes.new(name)
     bm.to_mesh(me)
     bm.free()
@@ -159,96 +260,54 @@ def part_mesh(name, sphere):
     return me
 
 
-def facing(along, toward):
-    """Rotation whose local Y runs along `along` and whose local Z faces `toward` as far as it can."""
-    y = along.normalized()
-    z = toward - toward.project(y)
-    z = z.normalized() if z.length > 1e-6 else y.orthogonal().normalized()
-    return Matrix((y.cross(z), y, z)).transposed().to_quaternion()
-
-
-def stretch(p0, p1, thickness, width=None):
-    """Placement of a unit cube stretched from p0 to p1, front face toward the camera."""
-    mid = (p0 + p1) / 2
-    return mid, facing(p1 - p0, EYE - mid), Vector((width or thickness, (p1 - p0).length, thickness))
-
-
-def placements(joints, size):
-    """Location, rotation and scale of each body part for one pose; unseen parts are left out."""
-    pts = {i: Vector(j) for i, j in enumerate(joints) if j}
-    if 5 not in pts or 6 not in pts:
-        return {}
-    shoulders = (pts[5] + pts[6]) / 2
-    hips = (pts[11] + pts[12]) / 2 if 11 in pts and 12 in pts else shoulders + DOWN * 1.4 * size
-    out = {"Torso": stretch(hips, shoulders, 0.5 * size, width=size)}
-    face = [pts[i] for i in range(5) if i in pts]
-    spine = (shoulders - hips).normalized()
-    head = sum(face, Vector()) / len(face) if face else shoulders + spine * 0.7 * size
-    diameter = 0.8 * size
-    out["Head"] = (head, Quaternion(), Vector((diameter,) * 3))
-    if 0 in pts and (1 in pts or 2 in pts):      # nose and an eye are visible: mark where the face is
-        look = (pts[0] - head) + (EYE - head).normalized() * 0.3 * diameter
-        centre = head + look.normalized() * 0.49 * diameter
-        out["Visor"] = (centre, facing(spine.cross(EYE - centre), EYE - centre),
-                        Vector((0.16 * diameter, 0.5 * diameter, 0.1 * diameter)))
-    for name, (i, j) in LIMBS.items():
-        if i in pts and j in pts:
-            out[name] = stretch(pts[i], pts[j], (0.32 if name.startswith("Leg") else 0.26) * size)
-    return out
-
-
+edit_prefs = bpy.context.preferences.edit
+body_mat = material("WB_Figure", FIGURE_COLOUR)
 visor_mat = material("WB_Visor", VISOR_COLOUR, roughness=0.4)
 for number, fig in enumerate(data["figures"], 1):
-    body = material(f"WB_Figure_{number:02d}", FIGURE_COLOURS[(number - 1) % len(FIGURE_COLOURS)])
     col = wb.collection(f"WB/Figures/Figure_{number:02d}")
-    parts = {}
-    for name in ["Head", "Visor", "Torso", *LIMBS]:
-        ob = bpy.data.objects.new(f"Fig{number:02d}_{name}", part_mesh(f"Fig{number:02d}_{name}", name == "Head"))
-        col.objects.link(ob)
-        wb.assign_clay(ob, visor_mat if name == "Visor" else body)
-        ob.rotation_mode = "QUATERNION"
-        if name not in ("Head", "Visor"):
-            mod = ob.modifiers.new("WB_Bevel", "BEVEL")
-            mod.width, mod.segments, mod.limit_method = BEVEL, 2, "ANGLE"
-        parts[name] = ob
     start = fig["start"]
-    # Hidden (scale 0) on every frame the person is not seen, including just before and after.
-    poses = [(start - 1, None), *enumerate(fig["joints"], start), (start + len(fig["joints"]), None)]
-    last = {}
-    for frame, joints in poses:
-        if not 1 <= frame <= FRAMES:
-            continue
-        placed = placements(joints, fig["size"]) if joints else {}
-        for name, ob in parts.items():
-            if name in placed:
-                loc, rot, scale = placed[name]
-                if name in last and rot.dot(last[name]) < 0:
-                    rot.negate()    # same hemisphere as the frame before, so nothing spins the long way
-                last[name] = rot
-                ob.location, ob.rotation_quaternion, ob.scale = loc, rot, scale
-            else:
-                ob.scale = (0, 0, 0)
-            for path in ("location", "rotation_quaternion", "scale"):
-                ob.keyframe_insert(path, frame=frame)
+    for name, track in fig["parts"].items():
+        size = [fig["size"] * s for s in data["part_sizes"][name]]
+        ob = bpy.data.objects.new(f"Fig{number:02d}_{name}", part_mesh(f"Fig{number:02d}_{name}", size, name == "Head"))
+        col.objects.link(ob)
+        wb.assign_clay(ob, visor_mat if name == "Visor" else body_mat)
+        ob.rotation_mode = "QUATERNION"
+        if name != "Head":
+            mod = ob.modifiers.new("WB_Bevel", "BEVEL")
+            mod.width, mod.segments, mod.limit_method = min(BEVEL, 0.2 * min(size)), 2, "ANGLE"
+        edit_prefs.keyframe_new_interpolation_type = "LINEAR"
+        for frame, loc, rot in zip(range(start, start + len(track["loc"])), track["loc"], track["rot"]):
+            ob.location, ob.rotation_quaternion = loc, rot
+            ob.keyframe_insert("location", frame=frame)
+            ob.keyframe_insert("rotation_quaternion", frame=frame)
+        shown(ob, start, start + len(track["loc"]) - 1)        # only while the person is
 
-# --- camera at the origin, level, looking along +Y
+# --- camera: placed and turned in every frame
 cam = bpy.data.objects.new("WB_Camera", bpy.data.cameras.new("WB_Camera"))
 wb.collection("WB/Cameras").objects.link(cam)
-cam.rotation_euler = (math.radians(90), 0, 0)
+cam.rotation_mode = "QUATERNION"
+edit_prefs.keyframe_new_interpolation_type = "LINEAR"
+for frame, (loc, rot) in enumerate(zip(data["camera"]["loc"], data["camera"]["rot"]), 1):
+    cam.location, cam.rotation_quaternion = loc, rot
+    cam.keyframe_insert("location", frame=frame)
+    cam.keyframe_insert("rotation_quaternion", frame=frame)
+edit_prefs.keyframe_new_interpolation_type = "BEZIER"
 cam.data.sensor_fit, cam.data.sensor_width, cam.data.lens = "HORIZONTAL", 36.0, data["lens"]
 cam.data.clip_start, cam.data.clip_end = 0.05, 5000.0
 sc.camera = cam
 
-# --- light: soft sky plus a sun from over the camera's left shoulder
+# --- light: a sun from over the left shoulder of each shot's first camera (so whatever faces the
+# camera is lit and every surface turned another way gets its own shade), standing still while the
+# camera moves, plus soft light from all round
 sun = bpy.data.objects.new("WB_Sun", bpy.data.lights.new("WB_Sun", "SUN"))
-sun.data.energy, sun.data.angle = 2.0, math.radians(5)
-sun.rotation_euler = Vector((0.8, 0.45, -0.7)).to_track_quat("-Z", "Y").to_euler()
+sun.data.energy, sun.data.angle = 2.5, math.radians(5)
+sun.rotation_euler = Vector((0.35, 1.0, -0.55)).to_track_quat("-Z", "Y").to_euler()
 wb.collection("WB/Lighting").objects.link(sun)
 world = bpy.data.worlds.new("WB_World")
 world.use_nodes = True
 bg = next(n for n in world.node_tree.nodes if n.type == "BACKGROUND")
 bg.inputs["Color"].default_value = (0.62, 0.64, 0.67, 1)
-bg.inputs["Strength"].default_value = 0.45
+bg.inputs["Strength"].default_value = 0.6
 sc.world = world
 
 # --- render look: clean clay with soft shadows and ambient occlusion
@@ -263,4 +322,4 @@ setting(sc.eevee, "fast_gi_distance", 1.0)
 setting(sc.view_settings, "view_transform", "Standard")
 sc.render.resolution_x, sc.render.resolution_y = a.width, a.height
 
-bpy.ops.wm.save_as_mainfile(filepath=a.out)
+bpy.ops.wm.save_as_mainfile(filepath=a.out, compress=True)
