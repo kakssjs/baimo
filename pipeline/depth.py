@@ -17,11 +17,17 @@ UNLIT_MIN = 0.01       # there (a dark room behind someone, the far end of a tun
                        # share of the frame
 
 
+def grey(frame, shape):
+    """Frame (HxWx3 uint8, RGB) in grey levels (uint8) at the depth model's working size shape (h, w)."""
+    h, w = shape
+    return cv2.cvtColor(cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA), cv2.COLOR_RGB2GRAY)
+
+
 def unlit(frame, shape):
     """Where frame (HxWx3 uint8, RGB) is too dark to see anything, at the depth model's working
     size shape ((h, w) bool): large patches nearly black and nearly even (see UNLIT)."""
     h, w = shape
-    luma = cv2.cvtColor(cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA), cv2.COLOR_RGB2GRAY).astype(np.float32)
+    luma = grey(frame, shape).astype(np.float32)
     k = max(3, round(0.02 * w) | 1)
     mean = cv2.blur(luma, (k, k))
     spread = np.sqrt(np.maximum(cv2.blur(luma * luma, (k, k)) - mean * mean, 0))

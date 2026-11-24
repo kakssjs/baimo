@@ -22,9 +22,9 @@ MAX_TURN = 20.0        # degrees per frame: a camera found to turn faster ...
 MAX_STEP = 0.25        # ... or to move further than this share of the distance to what it sees is lost there
 SMOOTH = 1.5           # frames: the camera's path is smoothed over about this many, which removes jitter
                        # from placing each frame on its own but keeps the shake of a hand-held camera
-STRETCH_TURN = 30.0    # a stretch of a shot (one set, see stretches) ends where the camera has turned this
-STRETCH_TRAVEL = 0.3   # many degrees, or moved this share of the distance to what it saw, from its start ...
-MIN_STRETCH = 12       # ... but lasts at least this many frames
+STRETCH_TURN = 45.0    # a stretch of a shot (one set, see stretches) ends where the camera has turned this
+STRETCH_TRAVEL = 0.5   # many degrees, or moved this share of the distance to what it saw, from its start ...
+MIN_STRETCH = 24       # ... but lasts at least this many frames (a set that changes more often looks unsteady)
 
 
 class Tracker:
@@ -191,7 +191,7 @@ def stretches(poses, dists):
             if far and b - a >= MIN_STRETCH:
                 break
             b += 1
-        if n - b < MIN_STRETCH:                     # no sliver of a stretch at the end of the shot
+        if n - b < MIN_STRETCH // 2:                # no sliver of a stretch at the end of the shot
             b = n
         out.append((a, b))
         a = b

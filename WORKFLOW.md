@@ -24,8 +24,8 @@ Every video becomes one **job** with its own folder `jobs/<id>/`. The page polls
 |---|---|---|---|
 | `queued` (Waiting) | Upload saved, waiting for the worker | `server/app.py` | `input.<ext>`, `job.json` |
 | `ingest` (Preparing video) | Check limits; convert to constant frame rate, even size, H.264 + AAC | `media.ingest` | `source.mp4` |
-| `analyse` (Reading depth and people) | See section 2 | `pipeline/analyse.py`, `depth.py`, `camera.py`, `planes.py`, `figures.py`, `mannequin.py` | `sets/NNN.npy`, `scene.json` |
-| `build` (Building 3D scene) | Blender builds the sets, the figures, the moving camera and the light | `pipeline/blender/build_scene.py` | `scene.blend` |
+| `analyse` (Reading depth and people) | See section 2 | `pipeline/analyse.py`, `depth.py`, `camera.py`, `planes.py`, `figures.py`, `mannequin.py` | `sets/NNN.npy`, `sets/NNN_edges.npz`, `sets/NNN_tone.png`, `scene.json` |
+| `build` (Building 3D scene) | Blender builds the sets in the footage's greys, the figures, a coloured shape for each thing someone carries, the moving camera and the light | `pipeline/blender/build_scene.py` | `scene.blend` |
 | `render` (Rendering in Blender) | Blender renders every frame (the .blend, which holds the whole scene, is zipped later, on its first download) | `pipeline/blender/render_shot.py` | `white.mp4` (`scene.zip`) |
 | `compose` (Combining) | Original (scaled to the render size) stacked over the white model, original audio kept | `media.compose` | `final.mp4` |
 | `done` / `failed` | Result shown, or the error message | `pipeline/job.py` | — |
@@ -48,6 +48,15 @@ correlates with the one before it; nothing is carried across a cut.
   over the pixels next to it that lie at the person's own depth (the outline model misses hair,
   hands and loose clothes), and then by 7 pixels all round, as a depth map blurs a person into
   what is next to them.
+- **Things people carry**: the same detector finds what people carry, hold, throw or ride on
+  (bags, cases, umbrellas, balls, bottles, cups, phones, boards, small animals; `PROPS` in
+  `figures.py`), the items a template is made to replace. It is ignored when the detector is
+  less than 30% sure of it, when it is less than 2% of the frame's height wide or tall, when it
+  covers more than 30% of the frame (a page held up to the camera, a wall), or when its box is
+  mostly a person's (40% overlap: that person, taken for a dog or a bird as well). SAM 2
+  outlines it and its depth is measured inside the outline, as a person's is. Where someone
+  holds it (see below), it is taken out of the set with the people, as it is drawn where it
+  goes; what nobody holds stays part of the set.
 - **Depth**: Depth Anything 3 (monocular, large) estimates depth and the sky at 1008 pixels on
   the long side. Where a frame is too dark to show anything (patches nearly black and nearly
   even over 2% of its width, together at least 1% of the frame), that is marked too: the model
@@ -68,9 +77,33 @@ correlates with the one before it; nothing is carried across a cut.
   part of them (their upper half, say).
 - Tracks are dropped as false detections when they have fewer than 8 detections, or when the
   detector or the pose model was typically unsure about them (coats on a rack, statues,
-  posters).
+  posters). So are tracks whose keypoints typically lie in an upright line, in a box that the
+  frame's side cuts: something upright and narrow at the side of the picture (the blurred edge
+  of a building, a pole), which looks like someone standing side on. Over a track, the
+  keypoints of someone walking side on spread about a third as wide as they are tall; a track
+  is dropped under a fifth.
 - Where a kept person was missed, SAM 2 outlines them again inside the bridged box, so they are
   still taken out of the set there.
+
+*Between passes: one track per thing carried* (`figures.track_things`).
+
+- Things are linked into tracks as people are. A track is dropped as a false detection when it
+  has fewer than 8 detections, when the detector was typically less than 35% sure of it, or when
+  fewer than 60% of its detections say it is one kind of thing (a bag the detector calls a
+  handbag in one frame and a suitcase in the next is one kind; a board in one frame and a bird
+  in the next is a part of someone, half seen).
+- Two tracks at the same time whose boxes typically lie at least 30% one inside the other follow
+  one thing boxed twice (the bag, and the bag with the hand on it), and become one.
+- Only what someone carries is kept: a thing held in at least 15% of the frames it is seen in.
+  Held means that a wrist the pose model is at least 30% sure of lies on its box (to within 30%
+  of the box's size), and that the person's box is at least three times as big as the thing's
+  (not a part of someone taken for something they hold). The rest (planks taken for books, a
+  taxi for a phone, a bag left on the floor) stays in the set.
+- Each track takes the name its detections give the most weight (`suitcase`, say).
+- A thing found again after it was lost (out of the picture, or in the dark) or after a cut is
+  the one of its kind last seen, unless that one is still in view (`analyse.follow_things`). So
+  a briefcase carried down the stairs, out of the picture for seconds and on into the next shot
+  stays one item, drawn as one shape in one colour.
 
 *2. The camera and the sets* (`pipeline/camera.py`, `pipeline/planes.py`).
 
@@ -82,10 +115,12 @@ correlates with the one before it; nothing is carried across a cut.
   is not taken; such frames, and frames with too few features, are filled in from their
   neighbours, and the path is smoothed over about 1.5 frames (the shake of a hand-held camera
   stays).
-- **Stretches.** A shot is split where the camera has turned more than 30°, or moved more than
-  0.3 times the distance to what it sees, since the stretch began; a camera that stands still or
-  pans gently keeps one stretch. Each stretch gets a keyframe: the frame whose view takes in
-  most of what the others see (the last frame of a pull-back).
+- **Stretches.** A shot is split where the camera has turned more than 45°, or moved more than
+  half the distance to what it sees, since the stretch began; a camera that stands still or
+  pans gently keeps one stretch. A stretch lasts at least 24 frames, even in a fast move: a set
+  that changes more often makes the walls look unsteady. A last stretch of under 12 frames joins
+  the one before it. Each stretch gets a keyframe: the frame whose view takes in most of what
+  the others see (the last frame of a pull-back).
 - **Sets.** For each stretch, every pixel of up to 40 of its frames (and of the 6 frames on
   either side) is placed in 3D at its depth and laid onto one picture in the keyframe's view.
   The median of the depths at each spot is taken, so people and anything else passing through
@@ -114,16 +149,22 @@ correlates with the one before it; nothing is carried across a cut.
   where the planes around them close them.
 - **Few, plain surfaces.** Then every piece (a connected part of one plane or card) smaller
   than 10% of the frame that lies on a larger piece next to it, within 12% of depth at the
-  median of its pixels, becomes part of it, smallest first, and pieces under 0.5% of the frame
+  median of its pixels, becomes part of it, smallest first, and pieces under 1% of the frame
   join the piece next to them they lie nearest even so. So a wall the depth model saw lumpy,
   in patches (most of all in dark footage), comes out one wall, no chips are left between the
   surfaces, and only what stands out from them (a staircase's side, a counter, a door frame)
   stays a piece of its own; small things close to a wall (a wall lamp, a picture, a door
   panel) become part of it. In the holes people leave, a piece never joins a plane that would
-  stand in front of where they stood. Each outline is then straightened into a polygon (the
-  second search's and the cards' twice as coarsely as the main planes'), and where two planes
-  meet at a fold (10° or more apart, within 3% of each other in depth along their seam), the
-  seam is moved onto the line where they really meet. So walls, floors and steps are flat,
+  stand in front of where they stood. Each outline is then rounded off with a disc of 2% of the
+  frame's width (notches and teeth the depth model leaves filled, thin bits sticking out cut
+  off) and straightened into a polygon within 1% of the frame's width of it (the second
+  search's and the cards' twice as coarsely as the main planes'); neither changes a piece by
+  more than a quarter of its thickness, so a rail or a lamp keeps its shape. Where the set is
+  built square, a side of a plane turned square that runs within 15° of one of the set's lines
+  (upright, or level along a wall or floor) is laid along it, as the picture shows that line
+  there, its corners moving at most three times as far as the straightening may. Where two
+  planes meet at a fold (10° or more apart, within 3% of each other in depth along their seam),
+  the seam is moved onto the line where they really meet. So walls, floors and steps are flat,
   corners sharp and edges straight and crisp, as on a set built by hand.
 - **Stairs.** The depth model sees a staircase's steps, but they are small and its rounded
   corners tilt them, so the plane search breaks them up unevenly. So where the set is built
@@ -173,14 +214,41 @@ correlates with the one before it; nothing is carried across a cut.
   the frame's width out), so no outline of the person stays in the set. A spot next to people
   that no frame could place (mostly the floor just in front of the camera) is closed the same
   way, not left empty.
+- **Flat everywhere.** Last, whatever is not on its plane (a plane that would run off there, a
+  hole pushed back behind the people who stood in it, a surface painted in) is made flat too,
+  so the set is flat surfaces only, with no ripples, dents or specks to show as the camera
+  moves. Such pixels of one plane at most 2% of the frame's width apart are one patch with the
+  plane's pixels between them, and the patch becomes the plane that fits it best, moved back
+  behind those people (facing the camera, where that plane would run off). Where pixels pushed
+  back behind people are less than half of their patch, they are specks of someone's outline
+  that the depth model blurred back, and the patch stays on its plane.
+- **Greys.** The set is painted as a set builder paints one, in 6 even greys, light and dark
+  where the footage is (`planes.set_tones`). The frames' grey levels are laid onto the set's
+  picture with their depths and the median is taken at each spot, so people passing through
+  drop out; a spot behind people throughout takes the median grey of the rest of its surface.
+  The levels are spread from the 2nd to the 98th percentile over all the sets of the shot
+  together, so a wall keeps its grey when one set hands over to the next. Each surface (as
+  Build follows them round) gets the median grey seen on it, so walls, floors and steps are one
+  even grey each, with no blotches where the light fell unevenly. A part of a surface that
+  stands out from the rest of it, lighter or darker by 18% of that spread once an even fall of
+  light across the surface is taken out, gets the median grey seen on that part: a window's
+  panes, a door's panels, a radiator or a lamp on a wall. Its outline is rounded off first with
+  a disc 0.3% of the picture's width in radius (so it is one whole shape, not a fringe of
+  specks), and it must then cover at least 0.02% of the picture. Each grey is then rounded to
+  the nearest of the 6, from 0.12 (dark grey) to 0.7 (light grey) albedo. A spot that was
+  behind people throughout takes the grey of the nearest spot of its own surface that was seen,
+  so no outline of them shows.
 - **Hand-over.** Each set is shown for its own stretch and stands perfectly still while the
-  camera moves through it; where one stretch ends, the next set takes over. Each set is also
-  built from the 6 frames on either side of its stretch, so neighbours match where they meet,
-  and over its last 8 frames a set takes on the next one's shape wherever both show the same
-  surface, so the switch itself changes next to nothing.
+  camera moves through it; where one stretch ends, the next set takes over in a single frame.
+  Each set is also built from the 6 frames on either side of its stretch, so neighbours match
+  where they meet. They are not blended into each other: two sets agree only in places, and
+  bending one towards the other corner by corner twisted its flat faces out of their planes on
+  the way, which showed as torn slabs for a third of a second.
 - **Storage.** Each set is `sets/NNN.npy`: inverse depth in the shot's units on its keyframe's
   picture, 0 where there is nothing (sky, or never seen), and -1 where it is left empty for the
-  dark.
+  dark. Beside it, `sets/NNN_edges.npz` holds where the pixels along its outlines go in the
+  mesh, on the straight lines the outlines were drawn as, and which surface each pixel is on
+  (see Build), and `sets/NNN_tone.png` its greys, on the same picture.
 
 *3. Figures* (`pipeline/mannequin.py`).
 
@@ -207,7 +275,14 @@ correlates with the one before it; nothing is carried across a cut.
   would make them giants far back in the set. How deep the set is under their feet is the median
   over the nine frames around (where it was found), as one frame's can be well off, such as below
   someone at the frame's edge. Where the floor is not seen,
-  they stand as much deeper than their outline as it says elsewhere in the track. The top of a
+  they stand as much deeper than their outline as it says elsewhere in the track. Where the
+  picture shows them, the set is behind them (their outline was cut out of it and closed with
+  what was behind them): it is found along the lines of sight through the keypoints the pose
+  model is at least 50% sure of (the median of where they meet the set), and taken from the
+  frames either side where the detector missed them. A floor more than 10% further back than
+  that is not what they stand on but one far below (someone in mid-air over a roof's edge), and
+  where they stand on no floor they stand at least 5% of its depth in front of it, so their
+  figure is never hidden inside a wall. The top of a
   desk or counter just below someone standing behind it can pass for the floor for a moment, so
   where most of the second around it (25 frames) says a desk hides the floor, it does. Where
   someone else's box covers the band, that person hides the floor, even where the band's depth
@@ -231,8 +306,10 @@ correlates with the one before it; nothing is carried across a cut.
   - the body fills the person's box from edge to edge where the picture shows them, so it is as
     big as the person looks, and a short box makes it crouch or crawl. An edge is not used where
     the frame's edge cuts it, or another person's box overlaps it or ends within 2% of it (the
-    one may hide the other there, or the box take them in). Where the box only bridges a gap in
-    the detections, its edges count for less;
+    one may hide the other there, or the box take them in), or where the person's own keypoints
+    lie more than 3% of the box's size past it (a box can stop short of a blurred arm flung
+    out, and would fold the arm in). Where the box only bridges a gap in the detections, its
+    edges count for less;
   - someone on all fours seen side on (a box less than 60% of their height tall and wider than
     tall, over most of nine frames) starts out lying along it, chest down, head towards the side
     their face is on (or was last seen on), so the fit finds the crawl rather than a kneel; the
@@ -241,12 +318,25 @@ correlates with the one before it; nothing is carried across a cut.
     edge cuts off does not count as short: someone behind a desk, or close up, looks short too;
   - the motion is smooth;
   - knees and elbows bend the right way;
-  - limbs the picture does not show (out of frame, hidden) hang in a rest pose, so the whole
-    body is always there: arms and thighs hang down, shins hang along the body, so on all
-    fours they lie back along the floor, knees down.
+  - a limb the picture does not show (out of frame, hidden, too blurred to place) keeps the pose,
+    relative to the body, that it is seen in up to 24 frames before or after (an arm still
+    pointing, a leg still mid-stride), blended between the two where it is seen on both sides;
+    further from any sight of it, it hangs in a rest pose, so the whole body is always there:
+    arms and thighs hang down, shins hang along the body, so on all fours they lie back along
+    the floor, knees down.
 - Torso and head turn with the person.
 - Each shot gets a **scale to metres**: the median person in it is 1.75 m tall, or, with nobody
   in the shot, the typical surface is 4 m away.
+
+*Last: the things carried* (`analyse.place_props`). Each kept thing is placed in 3D in every frame of
+its track: at the middle of its box, as deep as measured inside its outline (between
+detections, as deep as on either side), and as big as its box typically spans at that depth,
+across and up. A detection 1.5 times nearer or further than the median of the 5 around it has
+boxed something else with the thing (the floor beyond a bag) and is treated as a miss: its box
+and depth are bridged from either side, so the thing does not fly off to the wall behind for
+the frames in between. Its path is the median of where it was over 5 frames, as its depth is measured
+afresh in every frame; so it moves as the thing moves and hangs still where it is held still.
+It stays upright, turned as the camera is in the middle of its track.
 
 **Build (Blender).** One scene in metres, z up. Each shot has its own space, that of its first
 frame's camera (looking along +Y), scaled to metres:
@@ -255,6 +345,20 @@ frame's camera (looking along +Y), scaled to metres:
   - Every pixel of its picture is a vertex out along its line of sight, so the set lines up
     with the footage from the keyframe; a flat 8 × 8-pixel square (walls, floors, steps) is
     merged into one face.
+  - The pixels along each surface's outline are not left as a staircase of whole pixels, which
+    shows as one where the camera sees the surface from another side or from nearer than the
+    set was built from (a wall seen edge-on from the keyframe, stretched out later). Each
+    surface (neighbouring pixels whose slope carries on, as on one plane) is followed round as
+    a polygon within a pixel of its outline, and the outline's pixels go onto it, on along their
+    own plane and out to the line where the next surface's pixels meet them, so outlines stay
+    straight lines from everywhere and surfaces still meet. A pixel more than a pixel from the
+    polygon (a sharp point) or on two stretches of outline (a surface one pixel thin) stays
+    where it is, and an 8 × 8 square that a pixel moves in is not merged. A pixel square with
+    three corners on one surface and the fourth on another (a step where the outline runs at a
+    slant to the pixels) is cut along the diagonal that leaves the fourth out, so the surface's
+    edge runs from one outline pixel to the next rather than dipping in at every step, which
+    showed as a row of teeth from close up. This is written with the set, with the surface each
+    pixel is on (`sets/NNN_edges.npz`).
   - Where something near stands in front of something far, the surface is not stretched
     across the gap (that would show as a sheet once the camera moves): it breaks there, and
     what is behind carries on a few pixels under the edge. Not, though, at the top of
@@ -263,22 +367,37 @@ frame's camera (looking along +Y), scaled to metres:
     sight line between them runs level or a little down (at most 1 in 10), and the far side is
     at most 40% further back, the surface carries on from the front edge back to what stands
     behind it, as that top, and whoever stands there stands on it.
-  - Folds sharper than 40° stay as hard creases; everything else is smooth-shaded clay.
+  - Every face is shaded flat, as the plane it lies on, so walls and floors look like the plain
+    boards of a set built by hand, not like moulded clay.
+  - It is painted with its greys (`sets/NNN_tone.png`, mapped onto it pixel for pixel and kept
+    inside the `.blend`), so each wall, floor and step is one even grey, darker or lighter as in
+    the footage, with its windows, doors and lamps picked out.
   - What was left empty for the dark is a dark navy backdrop, unlit and casting no shadow, as in
     the reference films: one flat surface twice as far back as the farthest of the set, reaching
     3% of the set's width in behind its edges, so no light gap opens beside it as the camera
     moves.
-  - Each is shown only during its stretch; a shape key takes it onto the next set's surfaces
-    over its last 8 frames.
+  - Each is shown only during its stretch, and the next one replaces it in a single frame.
 - **Figures**: for each track, a sphere head, a box torso, two-part box arms and legs, and a
   small teal visor that shows which way the face points.
-  - All figures are one colour.
+  - All figures are one light clay grey (0.48 albedo), lighter than most of the set but not
+    white.
   - Every part keeps one size throughout.
   - Parts are keyframed on every frame and shown only while the person is in the shot.
+- **Props**: for each item carried, a simple shape in a colour of its own, so the items to
+  replace stand out from the grey model: a ball for a ball or fruit, an upright cylinder for a
+  bottle, cup, vase or bowl, and for everything else (bags, cases, phones, boards) a box half as
+  deep as the smaller of its width and height.
+  - The colours go in turn, item by item: brown, orange, blue, red, yellow, green, purple, pink.
+  - Each item is one object named after what it is (`Prop_01_suitcase`), in `WB/Props`, also
+    when it was lost and found again: keyframed on every frame it is seen in and shown only
+    then, in each stretch it is seen in as big as it looks there and turned as there.
 - **Camera**: placed and turned in every frame along the recovered path.
 - **Light**: a soft sky, a sun from over the left shoulder of each shot's first camera (it
-  stands still while the camera moves), ambient occlusion and soft shadows, so figures cast
-  shadows on the set.
+  stands still while the camera moves), and soft shadows, so figures cast shadows on the set.
+  The set casts none on itself, and ambient occlusion reaches 0.4 m, so walls and floors stay
+  plain, each one its own grey, lit by the way it faces, without blotches of shadow. The render
+  is exposed 1.2 stops down (`EXPOSURE`), so the clay shows in mid greys, as a white model is
+  shown, not glaring white.
 
 **Render.** EEVEE, at the source size enlarged so the long side is at least 1280 pixels.
 
@@ -352,9 +471,10 @@ uv run python -m pipeline bad19affd9d603bbb1ae2e3fe3f4a12b.mp4 --crop "592:240:0
 **Editing the white model in Blender** — download the scene (the zip is built on the first
 request and can be around a hundred megabytes), unzip it and open `scene.blend`, which holds
 everything. The sets are ordinary meshes in `WB/Set` (`Set_001`, … shown only during their
-shot); figures are in the `WB/Figures` collections, one per person, with ordinary keyframes on
-every part; `WB_Camera` follows the recovered path; `WB_Sun` and the `WB_Clay` material control
-the look.
+shot), each painted by its own material (`WB_Set_001`, …); figures are in the `WB/Figures`
+collections, one per person, with ordinary keyframes on every part; the things people carry are
+in `WB/Props` (`Prop_01_suitcase`, …), each with its own material, to swap for the real item;
+`WB_Camera` follows the recovered path; `WB_Sun` and the `WB_Figure` material control the look.
 
 ---
 
@@ -369,7 +489,7 @@ the look.
 | When planes are turned square to each other | `SQUARE`, `SQUARE_SHARE` in `pipeline/planes.py` |
 | How much around a person's outline is taken out of the set | `GROW`, `GROW_REACH`, `BLEED` in `pipeline/planes.py` |
 | Which pixels of a person's mask show what is behind them | `THROUGH`, `THROUGH_REACH` in `pipeline/planes.py` |
-| How the rest of the set is cleaned up (the second plane search, no chips or slivers, straight outlines, sharp corners) | `MIN_STEP`, `SPREAD`, `SPREAD_STEPS`, `PIECE`, `THIN`, `CARD_JUMP`, `CARD_MIN`, `STRAIGHT`, `OUTLINE`, `CREASE_GAP`, `CREASE_ANGLE`, `CREASE_REACH`, `MIN_SEAM` in `pipeline/planes.py` |
+| How the rest of the set is cleaned up (the second plane search, no chips or slivers, rounded and straight outlines laid along the set's lines, sharp corners, flat everywhere) | `MIN_STEP`, `SPREAD`, `SPREAD_STEPS`, `PIECE`, `THIN`, `CARD_JUMP`, `CARD_MIN`, `SMOOTH`, `STRAIGHT`, `OUTLINE`, `SNAP`, `ALONG_REACH`, `CREASE_GAP`, `CREASE_ANGLE`, `CREASE_REACH`, `MIN_SEAM`, `SPECKS`, `EDGE_FIT` in `pipeline/planes.py` |
 | How plain the set is (larger = fewer, larger surfaces; 0 = every piece found kept) | `ABSORB`, `ABSORB_FIT`, `SHARD` in `pipeline/planes.py` |
 | Which runs of stairs are rebuilt as even steps | `STAIR_ANGLE`, `STAIR_SPLIT`, `MIN_RISER`, `STAIR_GAP`, `STAIR_RUN`, `MIN_STAIRS`, `STAIR_EVEN`, `STAIR_PITCH`, `STAIR_FIT` in `pipeline/planes.py` |
 | What counts as too dark to see, and what becomes of it (closed by the surfaces around, or a dark void) | `UNLIT`, `UNLIT_EVEN`, `UNLIT_MIN` in `pipeline/depth.py`; `FLOOR`, `CLOSE`, `OPENING` in `pipeline/planes.py`; `VOID_COLOUR`, `VOID_MARGIN`, `VOID_FAR` in `pipeline/blender/build_scene.py` |
@@ -378,13 +498,14 @@ the look.
 | How a shot is split into sets, and how each is built | `STRETCH_TURN`, `STRETCH_TRAVEL`, `MIN_STRETCH` in `pipeline/camera.py`; `CANVAS`, `NEAREST`, `SHOT_SAMPLES`, `SEEN`, `BLEND` in `pipeline/planes.py` |
 | Assumed lens (changes how deep the scene looks) | `LENS` in `pipeline/analyse.py` |
 | Which detections count (confidence, minimum size) | `MIN_PERSON_SCORE`, `MIN_HEIGHT` in `pipeline/figures.py` |
-| Which tracks count, and when two tracks are one person | `MIN_TRACK`, `TRACK_SCORE`, `TRACK_KEYPOINTS`, `MAX_GAP`, `STITCH_GAP`, `STITCH_REACH`, `SAME_TRACK`, `SAME_POSE`, `SAME_PART` in `pipeline/figures.py` |
-| Which keypoints the figures follow | `MIN_SCORE` in `pipeline/mannequin.py` |
-| Where figures stand, and how firmly they keep their size and depth | `OPEN_EDGE`, `BELOW`, `OCCLUDER`, `BRINK`, `GROUND_SPAN`, `GROUND_STEADY`, `FLOOR_SPAN`, `TOUCH`, `NEARER` in `pipeline/analyse.py`; `FLOOR_SLACK`, `HOLD_GROW`, `HOLD_SHRINK`, `GROW_LIMIT`, `BRIDGED`, `DEPTH_LOOSE`, `DEPTH_FIRM` in `pipeline/mannequin.py` |
+| Which tracks count, and when two tracks are one person | `MIN_TRACK`, `TRACK_SCORE`, `TRACK_KEYPOINTS`, `POLE`, `SIDE`, `MAX_GAP`, `STITCH_GAP`, `STITCH_REACH`, `SAME_TRACK`, `SAME_POSE`, `SAME_PART` in `pipeline/figures.py` |
+| Which keypoints the figures follow, and how long an unseen limb keeps the pose it was seen in | `MIN_SCORE`, `REMEMBER` in `pipeline/mannequin.py` |
+| Where figures stand, and how firmly they keep their size and depth | `OPEN_EDGE`, `BELOW`, `OCCLUDER`, `BRINK`, `GROUND_SPAN`, `GROUND_STEADY`, `FLOOR_SPAN`, `TOUCH`, `NEARER`, `PAST`, `SURE`, `FRONT`, `BEYOND` in `pipeline/analyse.py`; `FLOOR_SLACK`, `HOLD_GROW`, `HOLD_SHRINK`, `GROW_LIMIT`, `BRIDGED`, `DEPTH_LOOSE`, `DEPTH_FIRM` in `pipeline/mannequin.py` |
 | When a figure starts out on all fours, and which way it faces | `CRAWL`, `CRAWL_SPAN`, `FACING` in `pipeline/mannequin.py` |
 | Figure proportions and part sizes | `HEIGHT`, `TORSO`, `LIMBS`, `PART_SIZES`, `TORSO_CENTRE`, `LIMB_PARTS` in `pipeline/mannequin.py` |
-| Figure, visor and set colours; bevel; which set squares become one face | `FIGURE_COLOUR`, `VISOR_COLOUR`, `SET_COLOUR`, `BEVEL`, `BLOCK`, `FLAT`, `CREASE`, `EDGE_ON`, `BACK`, `LEDGE`, `LEDGE_GAP` in `pipeline/blender/build_scene.py` |
-| How one set hands over to the next | `HAND_OVER`, `MATCH` in `pipeline/blender/build_scene.py` |
+| How many greys the set is painted in, how dark and light, and which parts of a surface get a grey of their own | `TONES`, `TONE_RANGE`, `TONE_CLIP`, `TONE_EDGE`, `TONE_SPECK`, `TONE_ROUND` in `pipeline/planes.py` |
+| Which things count as carried (what, how sure, how big, held by whom), and when two tracks are one thing | `PROPS`, `MIN_PROP_SCORE`, `MIN_PROP_SIZE`, `MAX_PROP_AREA`, `PROP_PERSON`, `PROP_TRACK_SCORE`, `SAME_THING`, `KINDS`, `SAME_KIND`, `CARRIED`, `HOLD`, `CARRIER` in `pipeline/figures.py`; how steady their path is, and which depth readings are taken as misses: `PROP_STEADY`, `PROP_JUMP` in `pipeline/analyse.py` |
+| Figure, visor, prop and set colours; how bright the render is; prop shapes; bevel; which set squares become one face | `FIGURE_COLOUR`, `VISOR_COLOUR`, `PROP_COLOURS`, `EXPOSURE`, `ROUND`, `UPRIGHT`, `PROP_DEPTH`, `SET_COLOUR`, `BEVEL`, `BLOCK`, `FLAT`, `EDGE_ON`, `BACK`, `LEDGE`, `LEDGE_GAP` in `pipeline/blender/build_scene.py` |
 | Light and render samples | the light and render sections at the end of `build_scene.py` |
 | Smallest output width | `output_size` in `pipeline/media.py` |
 | Stage names on the page | `STAGES` in `web/index.html` |
@@ -417,8 +538,10 @@ Interactive reference: <http://localhost:8000/docs>.
 | Job fails: "blender not found" / "ffmpeg not found" | Fix the path in `config.toml`; after installing ffmpeg, open a new terminal so PATH updates |
 | Fails at *Reading depth and people* with "No module named depth_anything_3" | The clone in section 3 is missing or `[paths].depth_anything_3` points elsewhere |
 | Fails at that stage the first time, other message | No internet for the one-time model downloads, or out of GPU memory (close other GPU apps) |
-| A person has no figure | Too small, too dark, seen in under 8 frames, or the detector and pose model were unsure of them (a person half hidden behind a counter, say); lower `MIN_HEIGHT`, `MIN_PERSON_SCORE`, `MIN_TRACK`, `TRACK_SCORE` or `TRACK_KEYPOINTS` in `figures.py` (lower values also let in coats, statues and posters) |
+| A person has no figure | Too small, too dark, seen in under 8 frames, or the detector and pose model were unsure of them (a person half hidden behind a counter, say); lower `MIN_HEIGHT`, `MIN_PERSON_SCORE`, `MIN_TRACK`, `TRACK_SCORE` or `TRACK_KEYPOINTS` in `figures.py` (lower values also let in coats, statues and posters). Someone who stands still, side on, at the very side of the picture can be taken for a pole; lower `POLE` (0 lets in the edges of buildings) |
 | One person becomes two figures, one after the other | They were lost for more than 48 frames or moved far while lost, or there was a cut; raise `STITCH_GAP` or `STITCH_REACH` |
+| Something carried has no coloured shape, or only part of the time | The detector missed it for long stretches (a bag in shadow, mostly behind a leg), or no wrist was seen on it in 15% of the frames it was seen in; lower `MIN_PROP_SCORE` or `CARRIED` in `figures.py` (lower values also let in false detections: planks taken for books, a taxi for a phone). Only the kinds in `PROPS` are looked for |
+| Something that is not carried has a coloured shape | A false detection that someone's hand passed over; raise `CARRIED` or `PROP_TRACK_SCORE` in `figures.py` |
 | An arm or leg points the wrong way | The pose model was unsure of those joints; raise `MIN_SCORE` in `mannequin.py` so they hang in the rest pose instead |
 | A flat patch or blob remains where a person stood | The spot was behind people in most of the frames that looked at it (someone who stays in one place, or covers much of the frame), and the planes around it could not close it |
 | Rows of faint dashes or thin stripes on walls and figures | Part of a set reaches very far away (kilometres), which spreads the sun's shadows too thin. Hole fills are kept near what is around them for this reason; if it shows, look in the `.blend` for set vertices far from the camera |
@@ -435,7 +558,7 @@ The full error text of a failed job is in `jobs/<id>/job.json`.
 
 ## 8. What was verified
 
-Checked on 2026-11-23 with an RTX 5060 laptop GPU (8 GB).
+Checked on 2026-11-24 with an RTX 5060 laptop GPU (8 GB).
 
 **Through the website.** The reference video `7182b76184e0351fc372b1f7f7d5c203.mp4` was sent to
 the website's API as the page sends it. Its film part (a hall with a staircase: 592×424, 30 fps,
@@ -445,29 +568,60 @@ with its three downloads.
 
 | Stage | Time |
 |---|---|
-| Preparing | 11 s |
-| Analysis (depth, people, camera path, sets, figures) | 821 s |
-| Building the Blender scene | 10 s |
-| Rendering | 176 s |
-| Combining | 11 s |
-| **Total** | **1029 s (17 min), about 1.3 s per frame** |
+| Preparing, analysis (depth, people, things carried, camera path, sets, figures) and building the Blender scene | 597 s |
+| Rendering and combining | 165 s |
+| **Total** | **762 s (13 min), about 1 s per frame** |
 
-The stage times were read every 10 s. At that rate a 60-second clip at 30 fps takes about 40
-minutes. `scene.zip` downloaded (36 MB: the `.blend` alone, which holds the whole scene), and the
-`.blend` in it opened in Blender with its 7 sets, the figures, the camera and all 787 frames, and
-no missing files.
+The stage was read every 10 s, too seldom to time the short stages on their own. At that rate a
+60-second clip at 30 fps takes about 30 minutes. `scene.zip` downloaded (26 MB: the `.blend`
+alone, which holds the whole scene), and the `.blend` in it opened in Blender with its 5 sets, 7
+figures, the briefcase (`Prop_01_handbag`), the camera and all 787 frames, and no missing files.
+Its picture matches the command-line run's below in the figures, their poses and the briefcase;
+the sets differ in small details of their panels and greys, as the website analyses the video
+afresh (the command-line run reused its first pass, and found 6 figures to the website's 7).
 
-**Four test clips**, run with the same code from the command line. Each clip reused its first
-pass (depth, people and camera path) and was checked at four to six sampled frames against the
-previous version. Each set was also checked for how far it reaches, and for jumps where one set
-hands over to the next.
+**Against the reference white model** (2026-11-24). Under its film, the reference video holds
+the white model made by hand that this project copies. Six frames of the hall (60, 205, 280,
+400, 600 and 750) were laid side by side: the film, their model and ours.
 
-| Clip | Source |
-|---|---|
-| Hall and staircase (the reference video) | 592×424, 30 fps, 787 frames |
-| Studio lot (well lit, handheld) | 592×240, 30 fps, 327 frames |
-| City rooftops (fast aerial camera, a stunt performer, sky) | 592×444, 30 fps, 669 frames |
-| Corridor (very dark, 5 shots) | 1280×528, 24 fps, 472 frames |
+- **Brightness.** The median grey of the picture is now 96 (theirs 102, before this version
+  150), and of the main figure's torso 130 (theirs 122, before 210), in levels 0–255.
+- **The briefcase is one item.** It is one brown object, `Prop_01_handbag`, shown in the three
+  stretches it is seen in (frames 48–81, 301–347 and 500–786), as big in each as it looks there.
+  Before, it was three objects, in brown, orange and blue.
+- **A wrong reading no longer throws it.** At frame 314 the detector boxed the bag together with
+  the floor beyond it, 4.3 m away against 1.0–1.2 m in the frames around. The frames bridged on
+  either side followed it, so the bag flew back and shrank to a speck for about 20 frames. That
+  reading is now taken as a miss, and the bag stays in the man's hand.
+- **One spread of greys per shot.** The three sets of the hall's first shot spread their grey
+  levels from 5–116, 7–88 and 4–108, so the middle one painted the same walls a level lighter;
+  they now share one (5–111). Where one set hands over to the next (frames 231→232 and
+  314→315), the mean change over the picture fell from 28.4 and 19.2 grey levels to 15.3 and
+  10.4. The change between ordinary frames fell from 1.3 to 0.8 (the render is darker), so most
+  of what is left is the two sets' shapes, not their greys.
+- **Plainer walls.** The set textures have far fewer specks: what stands out on a surface is a
+  whole, rounded shape (a window's panes, a lamp, a door's panels), and the walls around it are
+  one grey.
+
+**Four test clips**, run with the same code from the command line: the hall reused its first
+pass (depth, people and camera path), the other three ran it afresh. Each was checked at four
+to six sampled frames, for how far each set reaches, and for jumps where one set hands over to
+the next.
+
+| Clip | Source | Figures | Items carried | Sets per shot | Farthest set |
+|---|---|---|---|---|---|
+| Hall and staircase (the reference video) | 592×424, 30 fps, 787 frames | 6 | 1 (a briefcase) | 3, 1, 1 | 14.5 m |
+| Studio lot (well lit, handheld) | 592×240, 30 fps, 327 frames | 9 | 0 | 4, 1 | 48.9 m |
+| City rooftops (fast aerial camera, a stunt performer, sky) | 592×444, 30 fps, 669 frames | 6 | 0 | 7, 4, 5, 2 | 45.6 m |
+| Corridor (very dark, 5 shots) | 1280×528, 24 fps, 472 frames | 7 | 0 | 7, 4, 1, 1, 1 | 34.6 m |
+
+- The studio, rooftop and corridor stills show the same figures in the same places as before,
+  on sets in plain greys that follow the footage's light and dark; the dark corridor gives a
+  darker model. In the rooftop clip open sky is still built as set in places, as before.
+- No set reaches more than 50 m from its camera.
+
+*Checked on 2026-11-23, before the changes to the set's greys, the props and the render
+above:*
 
 - **Figures stand on the set.** The height of each figure's lowest shin corner above the set
   straight below it was measured on every frame where the set under the person's feet is found:
@@ -492,7 +646,7 @@ hands over to the next.
   - one more in the studio lot, 1.26 times before and 1.22 now.
 
   In the hall no figure changes size, and its frames render as before (seven sampled frames
-  differ by half a grey level on average), so the website run above still stands.
+  differ by half a grey level on average), so that day's website run still stood.
 - **Nothing else changed in the picture.** Apart from the leap, the sampled frames of the
   rooftop, studio and corridor clips match the previous version.
 - **The website's result matches the command line's.** At eight frames, the man on the stairs
@@ -539,7 +693,8 @@ Not verified:
 - **The camera path is an estimate.** It is found from features on the background, so a shot
   with little background to follow (a close-up, darkness, a whip pan) gets a rougher path, and
   over a long move its scale drifts. Each set is right for its own stretch, but where one
-  stretch hands over to the next, the set can change slightly.
+  stretch gives way to the next (at least 24 frames apart), the set changes in a single frame,
+  and surfaces the two sets placed differently jump a little.
 - **People can be missed.** The detector is unsure of people half hidden behind furniture, in
   near darkness or mostly out of frame, and tracks it is unsure of are dropped as false
   detections. Two people who overlap in the picture (one crawling behind another) can be boxed
@@ -552,11 +707,17 @@ Not verified:
   model's depth can be the two blurred together, so their figure can stand too near.
 - **Someone in mid-air is taken to stand on what is below them.** A leap above a water tower is
   placed as deep as the tower.
-- **Fast, blurred footage can hold false detections.** In the rooftop test clip, the blurred
-  edge of a building is taken for a person for 18 frames (0.6 s) and gets a figure at the
-  frame's edge. The performer, who reappears next to it, carries on as that figure, so his
-  figure starts at the frame's edge and jumps across to him. His size no longer follows it (see
-  section 8).
+- **Fast, blurred footage can still hold false detections.** Something upright and narrow at
+  the side of the picture (the blurred edge of a building in the rooftop clip) is dropped, since
+  its keypoints lie in a line; a false detection whose keypoints spread as a person's do still
+  gets a figure. The same rule can drop someone who stands still, side on and cut by the
+  frame's side, for most of the time they are seen; lower `POLE` in `figures.py` if it does.
+- **Only held things become props, and only while the detector sees them.** A bag in shadow
+  or mostly behind a leg can be lost for seconds, and is not drawn then; a thing nobody holds
+  stays grey in the set. Items are numbered, and coloured, in the order they first appear, not
+  by kind, and a thing found again is taken to be the last one of its kind seen, so two bags,
+  one lost from view as the other appears, are drawn as one item. A depth reading that is wrong
+  in more than two of five frames in a row is not caught, and the thing is placed at that depth.
 - **Scale and lens are estimates**, so distances in the `.blend` are approximate.
 - One job at a time; no progress percentage inside a stage; no accounts, so anyone who can open
   the site sees and can delete every job; Blender/ffmpeg error text includes server paths.

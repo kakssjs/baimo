@@ -41,10 +41,28 @@ CARD_MIN = 0.004      # between neighbouring pixels; pieces smaller than this fr
                       # surface next to them; the cards are turned square too, as the planes are
 ABSORB = 0.1          # pieces smaller than this fraction of a frame that lie on a larger piece next to them,
 ABSORB_FIT = 0.12     # within this share of depth at the median of their pixels, become part of it, smallest
-SHARD = 0.005         # first, and pieces smaller than this join the one next to them they lie nearest even so:
+SHARD = 0.01          # first, and pieces smaller than this join the one next to them they lie nearest even so:
                       # a set is a few large, plain surfaces, and only what stands out from them its own piece
-STRAIGHT = 0.005      # outlines of planes are straightened to within this fraction of the frame width ...
-OUTLINE = 2.0         # ... the clutter's this many times as coarsely
+SMOOTH = 0.02         # outlines of planes are rounded off with a disc of this share of the frame width (notches and
+                      # teeth the depth model leaves along them filled, thin bits cut off) ...
+STRAIGHT = 0.01       # ... then straightened to within this fraction of the frame width ...
+OUTLINE = 2.0         # ... the clutter's this many times as coarsely; on a set built square, a side of a plane
+SNAP = 15.0           # turned square that runs within this many degrees of one of the set's lines (upright, or
+ALONG_REACH = 3.0     # level along a wall or floor) is laid along it, its corners moving at most this many times
+                      # the straightening's reach: walls, doors and floors get the straight, square sides they
+                      # were built with
+EDGE_FIT = 1.0        # pixels: the pixels along each outline of a set's picture go onto the polygon it follows to
+                      # within this (see outline_shifts), so it stays a straight line from wherever it is seen
+TONES = 6             # the set is painted in this many even greys, light and dark where the footage is (see
+                      # set_tones) ...
+TONE_RANGE = (0.12, 0.7)    # ... from this darkest to this lightest (albedo, linear) ...
+TONE_CLIP = 2.0       # ... onto which the footage's grey levels over the shot's sets, from this percentile to 100
+                      # minus it, are spread
+TONE_EDGE = 0.18      # a part of a surface whose grey stands out from the rest of it by this share of that spread
+TONE_SPECK = 2e-4     # (once an even fall of light across it is taken out), over at least this share of the
+TONE_ROUND = 0.003    # picture, its outline rounded with a disc of this share of the picture's width (a whole
+                      # shape, not a fringe of specks), is a part of its own with its own grey: a window's panes, a
+                      # door's panels, a lamp on a wall
 CREASE_GAP = 0.03     # planes that meet at an angle (CREASE_ANGLE or more apart) and lie within this share of
 CREASE_ANGLE = 10.0   # each other in depth along their seam are cut along the line where they meet (a room's
 CREASE_REACH = 0.02   # corner, a box's edge), where it runs within this share of the frame width of the seam
@@ -60,6 +78,8 @@ STAIR_PITCH = (10.0, 60.0)  # STAIR_FIT of depth of them
 STAIR_FIT = 0.05
 BIG_PLANE = 0.03     # planes this large (walls, floors, ceilings) close off the holes people leave
 BEHIND = 0.05         # ... and no plane closes it more than this much nearer than the person standing in it
+SPECKS = 0.5          # ... save where such pixels, SMOOTH of the frame width apart at most, make up less than this
+                      # share of their patch: specks of a person's outline the depth model blurred back (see _flat)
 RUN_OFF = 1.5         # no surface lies more than this many times as far back as what is around it, or than
                       # anything seen in the set: a plane carried on towards its horizon runs off for kilometres
 HALO = 0.10           # depth maps blur a person into what is next to them: the plane closing a hole takes ...
@@ -340,6 +360,220 @@ def _disc(radius):
     return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
 
 
+def _along(polygon, dirs, centre, f, reach):
+    """A plane's outline (polygon: m x 2 pixel positions, x then y) with every side that runs within
+    SNAP degrees of one of the directions dirs (rows, in the camera's space) laid along it through the
+    side's middle, as the picture shows that direction there (towards its vanishing point): on a set
+    built square, the sides of a wall are upright or level, and those of a floor run along the walls.
+    Each corner next to a side so laid goes where its two sides now meet, unless that is more than
+    reach pixels from where it was (sides nearly in line); then it stays. centre: the principal
+    point; f: the focal length in pixels."""
+    m = len(polygon)
+    if m < 3:
+        return polygon
+    nxt = np.roll(polygon, -1, axis=0)
+    mid, side = (polygon + nxt) / 2, nxt - polygon
+    length = np.linalg.norm(side, axis=1)
+    run = side / np.maximum(length, 1e-9)[:, None]
+    x, y = (mid[:, 0] + 0.5 - centre[0]) / f, (mid[:, 1] + 0.5 - centre[1]) / f
+    best, laid = run.copy(), np.zeros(m, bool)
+    fit = np.full(m, math.cos(math.radians(SNAP)))
+    for d in dirs:
+        v = np.stack([d[0] - x * d[2], d[1] - y * d[2]], 1)
+        v /= np.maximum(np.linalg.norm(v, axis=1), 1e-9)[:, None]
+        c = np.abs((v * run).sum(1))
+        take = (c > fit) & (length > 0)
+        best[take], fit[take], laid[take] = v[take], c[take], True
+    out = polygon.copy()
+    for i in range(m):
+        j = i - 1                   # (side j ends at corner i, side i starts there)
+        if not (laid[i] or laid[j]):
+            continue
+        cross = best[j, 0] * best[i, 1] - best[j, 1] * best[i, 0]
+        if abs(cross) < 1e-3:
+            continue
+        w = mid[i] - mid[j]
+        corner = mid[j] + (w[0] * best[i, 1] - w[1] * best[i, 0]) / cross * best[j]
+        if np.linalg.norm(corner - polygon[i]) <= reach:
+            out[i] = corner
+    return out
+
+
+def outline_shifts(q):
+    """Where the pixels along the outlines of a set picture's surfaces (q: inverse depth, > 0 where
+    there is a surface; see SetDepth.splat) lie on the straight lines the outlines were drawn as
+    (see _straighten). In the picture an outline is a staircase of whole pixels, and seen from
+    elsewhere, as the camera moves through the set, the staircase shows. Neighbouring pixels whose
+    slope carries on to one side lie on one plane, and pixels linked so make one surface; each
+    surface is followed round as a polygon within EDGE_FIT pixels of its outline's pixels, and
+    each of those pixels moves onto it, on along its own plane, and out to the line where the
+    pixels on the other side move to from theirs, so that two surfaces still meet. A pixel on two
+    stretches of outline (where a surface is one pixel thin), or one that would move more than a
+    pixel (a sharp point), stays where it is. Returns the flat indices of the pixels moved, how far
+    they move across and down (pixels), their inverse depth there, and the surface every pixel is
+    on (a number per pixel, 0 where there is none)."""
+    h, w = q.shape
+    q = q.astype(np.float64)
+    valid = q > 0
+    tol = 1e-5 * np.abs(q)                      # (planes are stored in single precision)
+    sx, sy = np.diff(q, axis=1), np.diff(q, axis=0)
+    vx, vy = valid[:, 1:] & valid[:, :-1], valid[1:] & valid[:-1]
+    lx, ly = np.zeros_like(vx), np.zeros_like(vy)      # links to the neighbour on the right, below
+    run = vx[:, 1:] & vx[:, :-1] & (np.abs(sx[:, 1:] - sx[:, :-1]) <= tol[:, 1:-1])
+    lx[:, 1:] |= run
+    lx[:, :-1] |= run
+    run = vy[1:] & vy[:-1] & (np.abs(sy[1:] - sy[:-1]) <= tol[1:-1])
+    ly[1:] |= run
+    ly[:-1] |= run
+    gx, gy = np.full((h, w), np.nan), np.full((h, w), np.nan)    # the slope of each pixel's own plane
+    gx[:, :-1] = np.where(lx, sx, np.nan)
+    gx[:, 1:] = np.where(np.isnan(gx[:, 1:]) & lx, sx, gx[:, 1:])
+    gy[:-1] = np.where(ly, sy, np.nan)
+    gy[1:] = np.where(np.isnan(gy[1:]) & ly, sy, gy[1:])
+    grid = np.zeros((2 * h - 1, 2 * w - 1), bool)  # pixels, and the links between them
+    grid[::2, ::2], grid[::2, 1::2], grid[1::2, ::2] = valid, lx, ly
+    piece = ndimage.label(grid)[0][::2, ::2]
+    sizes = np.bincount(piece.ravel())
+    pixels, targets = [], []
+    for k, box in enumerate(ndimage.find_objects(piece), 1):
+        if box is None or sizes[k] < 16:
+            continue
+        at = np.array([box[1].start - 1, box[0].start - 1])            # (x, y of the padded box's corner)
+        for c in cv2.findContours(np.pad(piece[box] == k, 1).astype(np.uint8), cv2.RETR_LIST,
+                                  cv2.CHAIN_APPROX_NONE)[0]:
+            c = c[:, 0]
+            n = len(c)
+            corners = cv2.approxPolyDP(c, EDGE_FIT, True)[:, 0] if n >= 8 else c[:0]
+            if len(corners) < 3:
+                continue
+            idx = [np.flatnonzero((c == corners[0]).all(1))[0]]       # where each corner is on the outline
+            for p in corners[1:]:
+                found = np.flatnonzero((c == p).all(1))
+                later = np.concatenate([found, found + n])
+                later = later[later > idx[-1]]
+                if not len(later):
+                    break
+                idx.append(later[0])
+            if len(idx) < len(corners) or idx[-1] >= idx[0] + n:
+                continue
+            a = corners.astype(np.float64)
+            d = np.roll(a, -1, axis=0) - a                              # side s runs from corner s to s + 1
+            length = np.linalg.norm(d, axis=1)
+            if (length < 1e-9).any():
+                continue
+            # (the surface lies to the side of (dy, -dx) of the way its outline runs, so out is (-dy, dx))
+            out = np.stack([-d[:, 1], d[:, 0]], 1) / length[:, None]
+            reach = 0.5 * np.abs(out).max(1)        # (from its outline's pixels to the line between them and
+            off = (out * a).sum(1) + reach          # the next pixels out): side s's line is out_s . p = off_s
+            ends = np.append(idx[1:], idx[0] + n)
+            for s in range(len(a)):
+                along = c[np.arange(idx[s] + 1, ends[s]) % n].astype(np.float64)
+                pixels.append(along + at)
+                targets.append(along + at + (off[s] - along @ out[s])[:, None] * out[s])
+                prev = s - 1                        # (corner s: where the lines of its two sides cross)
+                m = np.array([out[prev], out[s]])
+                if abs(np.linalg.det(m)) < 0.2:
+                    corner = a[s] + (off[s] - a[s] @ out[s]) * out[s]
+                else:
+                    corner = np.linalg.solve(m, [off[prev], off[s]])
+                pixels.append(a[s][None] + at)
+                targets.append(corner[None] + at)
+    piece = piece.astype(np.int32)
+    empty = np.zeros(0, np.int32), np.zeros(0, np.float32), np.zeros(0, np.float32), np.zeros(0, np.float32), piece
+    if not pixels:
+        return empty
+    p, t = np.concatenate(pixels).astype(np.int64), np.concatenate(targets)
+    shift = t - p
+    flat = p[:, 1] * w + p[:, 0]
+    once = np.bincount(flat, minlength=h * w)[flat] == 1
+    keep = once & (np.linalg.norm(shift, axis=1) <= 1.0)
+    flat, shift = flat[keep], shift[keep]
+    across, down = shift[:, 0], shift[:, 1]
+    sx_, sy_ = gx.ravel()[flat], gy.ravel()[flat]
+    moved = q.ravel()[flat] + np.where(across != 0, sx_ * across, 0.0) + np.where(down != 0, sy_ * down, 0.0)
+    keep = np.isfinite(moved) & (moved > 0)
+    if not keep.any():
+        return empty
+    return (flat[keep].astype(np.int32), across[keep].astype(np.float32), down[keep].astype(np.float32),
+            moved[keep].astype(np.float32), piece)
+
+
+def tone_spread(greys):
+    """The grey levels that set_tones spreads over TONE_RANGE, (low, high), for the sets of one
+    shot whose grey levels are greys (each as SetDepth.splat gives it, nan where not seen): one
+    spread for them all, so a wall keeps its grey from one set to the next."""
+    seen = np.concatenate([np.zeros(0)] + [g[np.isfinite(g)] for g in greys])     # (a shot can have no set)
+    return tuple(np.percentile(seen, [TONE_CLIP, 100 - TONE_CLIP])) if len(seen) else (0.0, 255.0)
+
+
+def set_tones(g, valid, piece, spread):
+    """A set's picture painted in TONES even greys, for a texture (uint8 albedo, linear): its grey
+    levels (g, see SetDepth.splat: nan where not seen; valid where there is a set) spread over
+    TONE_RANGE from spread's low to its high (see tone_spread); each surface (piece: a number per
+    pixel, see outline_shifts) the median grey seen on it, as a set builder paints a wall, and
+    each part of it that stands out from the rest (see TONE_EDGE) the median grey seen on that
+    part, each rounded to the nearest of the TONES. So walls, floors and steps come out even,
+    with no blotches where the light fell unevenly, and windows, doors, lamps and rails keep the
+    footage's light and dark. What was not seen (behind people throughout) takes the grey of the
+    nearest of its own surface that was, so no outline of them shows."""
+    ok = valid & np.isfinite(g)
+    if not ok.any():
+        return np.full(g.shape, round(np.mean(TONE_RANGE) * 255), np.uint8)
+    lo, hi = spread
+    t = np.clip((np.where(ok, g, lo) - lo) / max(hi - lo, 1.0), 0, 1)
+    lab = np.where(ok, piece, 0).astype(np.int64)
+    n = int(lab.max()) + 1
+    y, x = np.indices(t.shape) / max(t.shape)
+    # The fall of light across each surface: a plane in grey over the picture, fitted to it and again
+    # to what of it does not stand out from the first fit.
+    terms = np.stack((np.ones_like(t), x, y))
+    use = lab > 0
+    for _ in range(2):
+        m = np.array([[np.bincount(lab[use], (a * b)[use], n) for b in terms] for a in terms]).transpose(2, 0, 1)
+        r = np.array([np.bincount(lab[use], (a * t)[use], n) for a in terms]).T
+        solvable = np.abs(np.linalg.det(m)) > 1e-12
+        c = np.zeros((n, 3))
+        c[solvable] = np.linalg.solve(m[solvable], r[solvable][..., None])[..., 0]     # (one 3x3 system each)
+        count = np.maximum(np.bincount(lab[use], minlength=n), 1)
+        c[~solvable, 0] = np.bincount(lab[use], t[use], n)[~solvable] / count[~solvable]   # (too small to tilt)
+        trend = c[lab, 0] + c[lab, 1] * x + c[lab, 2] * y
+        use = (lab > 0) & (np.abs(t - trend) < TONE_EDGE)
+    # What stands out, lighter or darker, over at least TONE_SPECK of one surface, its outline rounded
+    # (TONE_ROUND): parts of their own.
+    part = np.zeros(t.shape, np.int64)
+    disc = _disc(max(1, round(TONE_ROUND * t.shape[1])))
+    for side in (t - trend >= TONE_EDGE, trend - t >= TONE_EDGE):
+        side = cv2.morphologyEx(cv2.morphologyEx((side & (lab > 0)).astype(np.uint8), cv2.MORPH_OPEN, disc),
+                                cv2.MORPH_CLOSE, disc).astype(bool) & (lab > 0)
+        cc = ndimage.label(side)[0]
+        key = np.where(cc > 0, cc * n + lab, 0)        # (one part per surface it lies on)
+        _, inverse, sizes = np.unique(key, return_inverse=True, return_counts=True)
+        big = (sizes >= TONE_SPECK * t.size)[inverse.reshape(key.shape)] & (key > 0)
+        part[big] = part.max() + 1 + inverse.reshape(key.shape)[big]
+    region = np.where(part > 0, part + n, lab)          # (surfaces 1..n-1, parts beyond)
+    region = np.unique(region, return_inverse=True)[1].reshape(t.shape)
+    count = np.bincount(region.ravel())
+    grey = np.zeros(len(count))
+    has = np.flatnonzero(count)
+    grey[has] = ndimage.median(t, labels=region, index=has)
+    level = np.clip(np.round(grey[region] * (TONES - 1)), 0, TONES - 1) / (TONES - 1)
+    out = TONE_RANGE[0] + (TONE_RANGE[1] - TONE_RANGE[0]) * level
+    for k in np.unique(piece[valid & ~ok]):         # (not seen: as the nearest seen of its own surface)
+        own = piece == k
+        rows, cols = np.nonzero(own)
+        box = slice(rows.min(), rows.max() + 1), slice(cols.min(), cols.max() + 1)
+        seen = own[box] & ok[box]
+        if k > 0 and seen.any():
+            _, (iy, ix) = ndimage.distance_transform_edt(~seen, return_indices=True)
+            fill = own[box] & ~ok[box]
+            out[box][fill] = out[box][iy[fill], ix[fill]]
+            ok[box] |= fill
+    if not ok.all():            # (a surface never seen, and around the set: the nearest seen, so the
+        _, (iy, ix) = ndimage.distance_transform_edt(~ok, return_indices=True)     # edges blend with
+        out = out[iy, ix]                                                           # nothing else)
+    return np.round(out * 255).astype(np.uint8)
+
+
 def motion_view(frame, hole, sky):
     """What camera.Tracker needs from a frame: a small grey copy, its contrast evened out (a dark
     frame otherwise yields too few corners to follow), and where the background is."""
@@ -405,21 +639,23 @@ class SetDepth:
         label = self._take_halo(q, label, planes, hole, sky, people, round(HALO_REACH * width))
         closed = label
         label = self._tidy(label, sky, hole, PIECE * area, max(1, round(THIN * width)))
-        label = self._straighten(label, sky, STRAIGHT * width, found, OUTLINE)
+        label = self._straighten(label, sky, STRAIGHT * width, found, OUTLINE, round(SMOOTH * width),
+                                 planes, f, frame)
         label = self._crease(label, planes, f, width)
         first_card = len(planes)
         planes, label = self._cards(q, label, planes, hole, sky, area)
         if frame is not None:       # (the cards square too)
             planes, label, _ = self._square(q, planes, label, f, frame, first_card)
         label = self._absorb(q, label, planes, hole, people, area)
-        label = self._straighten(label, sky, STRAIGHT * width, found, OUTLINE)
+        label = self._straighten(label, sky, STRAIGHT * width, found, OUTLINE, round(SMOOTH * width),
+                                 planes, f, frame)
         if frame is not None:
             planes, label = self._stairs(q, label, planes, hole, sky, f, frame, area)
         label = self._keep_behind(label, closed, planes, hole, people, area)
-        out = self._compose(q, hole, sky, planes, label, people)
+        out = self._compose(q, hole, sky, planes, label, people, width)
         return (out if empty is None else torch.where(empty, torch.full_like(out, -1.0), out)), label
 
-    def splat(self, frames, poses, key, dark=None):
+    def splat(self, frames, poses, key, dark=None, grey=None):
         """One set for a stretch of a shot (see camera.stretches), seen from its keyframe.
 
         Every pixel of frames from across the stretch is placed in 3D at its depth, where the
@@ -428,10 +664,13 @@ class SetDepth:
         are found once, so the set holds perfectly still while the camera moves through it.
         frames(t) -> (depth, hole, sky) for t in range(len(poses)); poses[t] = (R, T, factor) of
         frame t relative to the keyframe (see camera.relative); dark(t), if given, -> where frame
-        t is too dark to see (see depth.unlit), or None. Returns the picture's inverse depth (0
-        where there is no set: sky, or never seen; -1 where it is left empty for the dark) and its
-        principal point (cx, cy) in pixels from its top-left corner (same focal length as the
-        frames'), or None if too little of it is seen.
+        t is too dark to see (see depth.unlit), or None; grey(t), if given, -> frame t in grey
+        levels (see depth.grey), which are laid onto the picture the same way. Returns the
+        picture's inverse depth (0 where there is no set: sky, or never seen; -1 where it is left
+        empty for the dark), its principal point (cx, cy) in pixels from its top-left corner (same
+        focal length as the frames') and, given grey, the median grey level seen at each of its
+        pixels (nan where it was behind people, or not seen; else None); or None if too little of it
+        is seen.
         """
         dev = self.device
         n = len(poses)
@@ -497,6 +736,7 @@ class SetDepth:
             return torch.cat(idx), torch.cat(val)
 
         stack = np.full((len(picks), ch, cw), np.nan, np.float32)
+        greys = None if grey is None else np.full((len(picks), ch, cw), np.nan, np.float32)
         count = torch.zeros(ch * cw, device=dev, dtype=torch.int32)
         looks = torch.zeros(ch * cw, device=dev, dtype=torch.int32)
         sky_votes = torch.zeros(ch * cw, device=dev, dtype=torch.int32)
@@ -524,6 +764,12 @@ class SetDepth:
             q.scatter_reduce_(0, idx, val, "amax")      # where the frame saw two things, the nearer
             seen = torch.zeros(ch * cw, device=dev, dtype=torch.bool)
             seen[idx] = True
+            if greys is not None:                       # (the grey of that nearer thing)
+                _, level = splat(p[background], torch.from_numpy(grey(t)).to(dev)[background].float())
+                front = val >= q[idx]
+                g = torch.full((ch * cw,), float("nan"), device=dev)
+                g[idx[front]] = level[front]
+                greys[k] = g.view(ch, cw).cpu().numpy()
             body = torch.from_numpy(_body_depth(dn, proper & finite & ~sky)).to(dev)
             pidx, pval = splat(place(t, body)[person])
             people.scatter_reduce_(0, pidx, pval, "amin")
@@ -545,11 +791,16 @@ class SetDepth:
                 dark_here[didx] = True
                 dark_votes += dark_here
             stack[k] = torch.where(seen, q, torch.full_like(q, float("nan"))).view(ch, cw).cpu().numpy()
-        qc = np.empty((ch, cw), np.float32)
-        for r0 in range(0, ch, 128):
-            part = torch.from_numpy(np.ascontiguousarray(stack[:, r0:r0 + 128])).to(dev)
-            qc[r0:r0 + 128] = part.nanmedian(0).values.cpu().numpy()
-        del stack
+        def median(stack):
+            out = np.empty((ch, cw), np.float32)
+            for r0 in range(0, ch, 128):
+                part = torch.from_numpy(np.ascontiguousarray(stack[:, r0:r0 + 128])).to(dev)
+                out[r0:r0 + 128] = part.nanmedian(0).values.cpu().numpy()
+            return out
+
+        qc = median(stack)
+        gc_ = None if greys is None else median(greys)
+        del stack, greys
         count, looks, sky_votes, dark_votes = (x.view(ch, cw).cpu().numpy() for x in (count, looks, sky_votes, dark_votes))
         people = people.view(ch, cw).cpu().numpy()
         people[~np.isfinite(people)] = 0
@@ -583,10 +834,14 @@ class SetDepth:
         dark_c = None if dark is None else torch.from_numpy(2 * dark_votes > count).to(dev)    # (most frames
         try:                                                    # that saw it there saw it too dark)
             out_q, _ = self.solve(torch.from_numpy(qc).to(dev), torch.from_numpy(hole_c).to(dev),
-                                  torch.from_numpy(sky_c).to(dev), f, h * w, torch.from_numpy(people).to(dev), dark_c)
+                                  torch.from_numpy(sky_c).to(dev), f, h * w, torch.from_numpy(people).to(dev),
+                                  dark_c)
         finally:
             self.centre = None
-        return np.where(sky_c, 0, out_q.cpu().numpy()).astype(np.float32), centre
+        depth = np.where(sky_c, 0, out_q.cpu().numpy()).astype(np.float32)
+        # (where the set was closed behind people, what the few frames that saw it there show is
+        # likely someone whose outline was missed: not seen, like what no frame saw)
+        return depth, centre, None if gc_ is None else np.where(known & (depth > 0), gc_, np.nan).astype(np.float32)
 
     def _planes(self, q, hole, sky, f, area, min_plane=None, unlit=None):
         """Find the view's planes, none smaller than min_plane of a frame (MIN_PLANE if None), and
@@ -1051,23 +1306,54 @@ class SetDepth:
         lab[drop] = 0
         return torch.from_numpy(_nearest(lab, (lab == 0) & hole.cpu().numpy() & ~sky.cpu().numpy())).to(label.device)
 
-    @staticmethod
-    def _straighten(label, sky, eps, first, coarse):
-        """Outlines of planes made straight, as on a set built by hand: each plane's outline becomes
-        a polygon within eps pixels of it (coarse times that for the planes after the first first,
-        the clutter), and the polygons are laid down largest first, so that smaller ones keep their
-        shape on top of larger ones (a pixel no polygon covers keeps its plane)."""
+    def _straighten(self, label, sky, eps, first, coarse, radius, P, f, frame):
+        """Outlines of planes made smooth and straight, as on a set built by hand. Each plane's
+        outline is first rounded off with a disc of radius pixels (notches and teeth narrower than
+        it filled, thin bits sticking out cut off), then becomes a polygon within eps pixels of it
+        (coarse times that for the planes after the first first, the clutter); neither by more than
+        a quarter of the plane's thickness, so that a rail or a lamp keeps its shape. On a set
+        built square (frame: its three main directions, or None), the sides of a plane turned
+        square run along the set's lines (see _along). Both are laid down largest plane first, so
+        that smaller ones keep their shape on top of larger ones (a pixel none covers keeps its
+        plane). P: the planes (f: focal length in pixels)."""
         lab = label.cpu().numpy().astype(np.int32)
         sky_n = sky.cpu().numpy()
+        lines = {}                      # (per plane turned square: the two main directions it lies along)
+        if frame is not None and len(P):
+            c = np.abs(_unit_normals(P.cpu().numpy(), f) @ frame.T)
+            for k in np.flatnonzero(c.max(1) > math.cos(math.radians(1.0))) + 1:
+                lines[k] = np.delete(frame, c[k - 1].argmax(), axis=0)
+        h, w = lab.shape
+        centre = self.centre or (w / 2, h / 2)
+        ks, areas = np.unique(lab[lab > 0], return_counts=True)
+        order = ks[np.argsort(-areas)]
+        out, most = lab.copy(), {}
+        boxes = dict(_boxes(lab, radius + 1))
+        for k in order:
+            mine = (lab[boxes[k]] == k).astype(np.uint8)
+            most[k] = cv2.distanceTransform(mine, cv2.DIST_L2, 5).max() / 2       # (a quarter of its thickness)
+            r = round(min(radius, most[k]))
+            if r >= 1:
+                mine = cv2.morphologyEx(cv2.morphologyEx(mine, cv2.MORPH_CLOSE, _disc(r)), cv2.MORPH_OPEN, _disc(r))
+            out[boxes[k]][(mine > 0) & ~sky_n[boxes[k]]] = k
+        lab = out
         out = lab.copy()
         boxes = dict(_boxes(lab, 1))
-        ks, areas = np.unique(lab[lab > 0], return_counts=True)
-        for k in ks[np.argsort(-areas)]:
-            box, e = boxes[k], eps * (coarse if k > first else 1.0)
+        for k in order:
+            if k not in boxes:          # (rounded off altogether)
+                continue
+            box, e = boxes[k], min(eps * (coarse if k > first else 1.0), most[k])
             outlines, tree = cv2.findContours((lab[box] == k).astype(np.uint8), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+            at = np.array([box[1].start, box[0].start], np.float64)        # (the box's corner, x then y)
+            polygons = []
+            for o in outlines:
+                corners = cv2.approxPolyDP(o, e, True)[:, 0].astype(np.float64)
+                if k in lines:
+                    corners = _along(corners + at, lines[k], centre, f, ALONG_REACH * e) - at
+                polygons.append(np.round(corners * 16).astype(np.int32))
             canvas = np.zeros(out[box].shape, np.uint8)
-            cv2.fillPoly(canvas, [cv2.approxPolyDP(o, e, True) for o, t in zip(outlines, tree[0]) if t[3] < 0], 1)
-            cv2.fillPoly(canvas, [cv2.approxPolyDP(o, e, True) for o, t in zip(outlines, tree[0]) if t[3] >= 0], 0)
+            cv2.fillPoly(canvas, [p for p, t in zip(polygons, tree[0]) if t[3] < 0], 1, shift=4)
+            cv2.fillPoly(canvas, [p for p, t in zip(polygons, tree[0]) if t[3] >= 0], 0, shift=4)
             out[box][canvas.astype(bool) & ~sky_n[box]] = k
         return torch.from_numpy(out).to(label.device).long()
 
@@ -1342,10 +1628,11 @@ class SetDepth:
             back = (stats[:, cv2.CC_STAT_AREA] >= SHARD * area)[cc] & back
         return torch.where(torch.from_numpy(back).to(label.device), closed, label)
 
-    def _compose(self, q, hole, sky, P, label, people):
+    def _compose(self, q, hole, sky, P, label, people, width):
         """Inverse depth of the set: its planes and cards, the model's own (smoothed) surface
         where neither may lie (see RUN_OFF), and a painted-in surface where a hole could not be closed;
-        in the holes, never in front of the people who stood there (see _limit)."""
+        in the holes, never in front of the people who stood there (see _limit); all of it flat
+        (see _flat; width: of a frame, in pixels)."""
         h, w = q.shape
         dev = q.device
         qn = q.cpu().numpy().astype(np.float32)
@@ -1366,4 +1653,50 @@ class SetDepth:
             out = torch.where((label > 0) & (flat > float(q.min()) / RUN_OFF), flat, out)
         limit = torch.from_numpy(_limit(people.cpu().numpy())).to(dev)
         out = torch.where(hole, torch.minimum(out, limit), out)
+        out = self._flat(out, P, label, sky, limit, width)
         return torch.where(sky, torch.zeros_like(out), out.clamp_min(1e-6))
+
+    def _flat(self, out, P, label, sky, limit, width):
+        """The set with every patch that is not on its plane (where that would run off, or where a
+        hole could not be closed by it or was pushed back behind the people who stood there: see
+        _compose) made flat too, so that the whole set is flat surfaces, with no ripples, dents or
+        specks to show as the camera moves. Such pixels of one plane at most SMOOTH of the frame
+        width (width, in pixels) apart make one patch with the pixels of the plane between them
+        (those pushed back behind people apart from the rest). Where pixels pushed back are less
+        than SPECKS of their patch, they are specks of someone's outline that the depth model
+        blurred back (see _limit), and the patch stays on its plane; otherwise it becomes the
+        plane that fits it best, moved back as far as it must be to stay behind those people
+        (limit), or one facing the camera at its middle depth where that plane would run off."""
+        h, w = out.shape
+        ys, xs = self._grid(h, w)
+        zero = torch.zeros((1, 3), device=out.device)
+        p = torch.cat([zero, P])[label] if len(P) else torch.zeros(h, w, 3, device=out.device)
+        flat = p[..., 0] * xs + p[..., 1] * ys + p[..., 2]
+        off = (~sky & ((label == 0) | ((out - flat).abs() > 1e-4 * flat.abs()))).cpu().numpy()
+        if not off.any():
+            return out
+        o, F, X, Y, lim = (t.cpu().numpy().astype(np.float64) for t in (out, flat, xs, ys, limit))
+        lab, surface = label.cpu().numpy(), ~sky.cpu().numpy()
+        r = max(1, round(SMOOTH * width))
+        for k in np.unique(lab[off]):
+            mine = (lab == k) & surface
+            pushed = off & mine & (o < F)       # (pushed back behind people; the rest would run off, or has no plane)
+            for part in (pushed, off & mine & ~pushed):
+                joined = cv2.morphologyEx(part.astype(np.uint8), cv2.MORPH_CLOSE, _disc(r)).astype(bool) & mine
+                patches, _ = ndimage.label(joined, np.ones((3, 3)))
+                for c, box in enumerate(ndimage.find_objects(patches), 1):
+                    m = patches[box] == c
+                    if part is pushed and part[box][m].mean() < SPECKS:
+                        o[box][m] = F[box][m]
+                        continue
+                    A = np.stack([X[box][m], Y[box][m], np.ones(m.sum())], 1)
+                    v, cap = o[box][m], lim[box][m]
+                    coef = np.linalg.lstsq(A, v, rcond=None)[0] if m.sum() >= 3 else np.array([0.0, 0.0, np.median(v)])
+                    fit = A @ coef
+                    over = np.max(fit - cap)            # (nearer than the people who stood there: moved back)
+                    if over > 0:
+                        fit = fit - over
+                    if fit.min() <= 0.5 * v.min():      # (it would run off: one facing the camera instead)
+                        fit = np.full_like(v, min(np.median(v), cap.min()))
+                    o[box][m] = fit
+        return torch.from_numpy(o.astype(np.float32)).to(out.device)

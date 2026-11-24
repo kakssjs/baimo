@@ -27,6 +27,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+from scipy import ndimage
 
 from . import camera, figures, mannequin, planes
 from . import depth as dp
@@ -54,6 +55,15 @@ TOUCH = 0.02            # boxes this near each other (share of the frame) count 
                         # reaches this much further down the picture than another's is in front of them (where the
                         # depth model cannot tell)
 NEARER = 0.1            # someone this share nearer than another (by the depth model) is in front of them
+PAST = 0.03             # a box's edge is not where the body ends where the person's own keypoints lie this share of the
+                        # box's size past it: a box can stop short of a blurred arm flung out
+SURE = 0.5              # keypoints the pose model scores at least this are where the picture shows the person ...
+FRONT = 0.05            # ... and the set there is behind them: they stand at least this share of its depth in front
+BEYOND = 0.1            # of it, and a floor more than this share further back than it is no floor they stand on
+PROP_STEADY = 5         # frames: the path of a thing someone carries is the median of where it was found over this
+                        # many (its depth is measured afresh in every frame; a hold stays a hold)
+PROP_JUMP = 1.5         # a thing found this many times nearer or further than the median of where it was found
+                        # around it is something else boxed with it (the floor beyond a bag): as if not found
 # From the camera's space (x right, y down, z forward) to the scene's (x right, y forward, z up).
 TO_SCENE = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]])
 
@@ -98,10 +108,13 @@ class Store:
         self.hole = np.lib.format.open_memmap(folder / "hole.npy", "w+", np.uint8, (frames, h, (w + 7) // 8))
         self.sky = np.lib.format.open_memmap(folder / "sky.npy", "w+", np.uint8, (frames, h, (w + 7) // 8))
         self.dark = np.lib.format.open_memmap(folder / "dark.npy", "w+", np.uint8, (frames, h, (w + 7) // 8))
+        self.grey = np.lib.format.open_memmap(folder / "grey.npy", "w+", np.uint8, (frames, h, w))
 
-    def put(self, i, depth=None, hole=None, sky=None, dark=None):
+    def put(self, i, depth=None, hole=None, sky=None, dark=None, grey=None):
         if depth is not None:
             self.depth[i] = depth
+        if grey is not None:
+            self.grey[i] = grey
         if hole is not None:
             self.hole[i] = np.packbits(hole, axis=1)
         if sky is not None:
@@ -118,14 +131,18 @@ class Store:
         """Where frame i is too dark to see (see depth.unlit)."""
         return np.unpackbits(self.dark[i], axis=1, count=self.w).astype(bool)
 
+    def get_grey(self, i):
+        """Frame i in grey levels (uint8), at the depth maps' size."""
+        return np.array(self.grey[i])
+
     def close(self):
-        del self.depth, self.hole, self.sky, self.dark
+        del self.depth, self.hole, self.sky, self.dark, self.grey
         gc.collect()
 
 
 def measure(person, mask, depth, width, height):
-    """Adds the person's depth ("z", median over their outline) and the depth at each of their
-    keypoints ("jz", nan where unknown), in the depth model's units. mask is frame-sized."""
+    """Adds the person's (or thing's) depth ("z", median over their outline) and the depth at each
+    of their keypoints ("jz", nan where unknown), in the depth model's units. mask is frame-sized."""
     h, w = depth.shape
     m = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
     core = cv2.erode(m, np.ones((7, 7), np.uint8)).astype(bool)     # depth maps blur across outlines
@@ -216,14 +233,63 @@ def box_edges(pose, others, width, height):
     """Where the person's body ends in the picture, at the top and to either side ("top", "left",
     "right": y or x in pixels): their box's edges, each unless the frame's edge cuts it off, or
     another person's box overlaps it there, or nearly (who may hide them there, or whom the box
-    may have taken in: then both boxes can end alike); then None. others: the other people's boxes."""
+    may have taken in: then both boxes can end alike), or their own keypoints (those the mannequin
+    follows) lie more than PAST past it; then None. others: the other people's boxes."""
     x0, y0, x1, y1 = pose["box"]
     m, n = TOUCH * height, TOUCH * width
     across = [b for b in others if b[0] < x1 and x0 < b[2]]
     down = [b for b in others if b[1] < y1 and y0 < b[3]]
-    return {"top": None if y0 <= OPEN_EDGE * height or any(b[1] - m <= y0 <= b[3] + m for b in across) else float(y0),
-            "left": None if x0 <= OPEN_EDGE * width or any(b[0] - n <= x0 <= b[2] + n for b in down) else float(x0),
-            "right": None if x1 >= (1 - OPEN_EDGE) * width or any(b[0] - n <= x1 <= b[2] + n for b in down) else float(x1)}
+    kp = np.zeros((0, 3)) if pose.get("kp") is None else np.asarray(pose["kp"], np.float64)
+    kp = kp[kp[:, 2] >= mannequin.MIN_SCORE]
+    out_x, out_y = PAST * (x1 - x0), PAST * (y1 - y0)
+    return {"top": None if y0 <= OPEN_EDGE * height or any(b[1] - m <= y0 <= b[3] + m for b in across)
+            or (kp[:, 1] < y0 - out_y).any() else float(y0),
+            "left": None if x0 <= OPEN_EDGE * width or any(b[0] - n <= x0 <= b[2] + n for b in down)
+            or (kp[:, 0] < x0 - out_x).any() else float(x0),
+            "right": None if x1 >= (1 - OPEN_EDGE) * width or any(b[0] - n <= x1 <= b[2] + n for b in down)
+            or (kp[:, 0] > x1 + out_x).any() else float(x1)}
+
+
+def _sight(xs, ys, z, canvas, centre, rel, f):
+    """How deep the set is where the frame's lines of sight through (xs, ys) first meet it (in the
+    frame's camera, shot units; nan where none does), looked for from a quarter to four times z.
+    xs, ys: the lines' directions, (pixel - middle of the depth map) / f; f: the depth maps' focal
+    length in their pixels. canvas, centre, rel: as for on_set."""
+    rays = np.stack((xs, ys, np.ones_like(xs)), -1).reshape(-1, 1, 3)
+    d = 1.0 / np.linspace(4.0 / z, 0.25 / z, 400)        # along each line of sight, near to far
+    R, T, _ = rel
+    p = (rays * d[None, :, None] - np.asarray(T)) @ np.asarray(R)          # in the keyframe's camera
+    ahead = p[..., 2] > 1e-6
+    pz = np.where(ahead, p[..., 2], 1.0)
+    i = np.round(f * p[..., 1] / pz + centre[1] - 0.5).astype(np.int64)
+    j = np.round(f * p[..., 0] / pz + centre[0] - 0.5).astype(np.int64)
+    inside = ahead & (i >= 0) & (i < canvas.shape[0]) & (j >= 0) & (j < canvas.shape[1])
+    q = np.where(inside, canvas[np.clip(i, 0, canvas.shape[0] - 1), np.clip(j, 0, canvas.shape[1] - 1)], 0.0)
+    behind = np.where(q > 0, q * pz - 1.0, -1.0)    # >= 0 where the line of sight is at or behind the set
+    cross = (behind[:, 1:] >= 0) & (behind[:, :-1] < 0)
+    k = np.argmax(cross, axis=1)
+    n = np.arange(len(k))
+    a, b = behind[n, k], behind[n, k + 1]
+    meet = np.where(cross[n, k], d[k] + (d[k + 1] - d[k]) * -a / np.where(b > a, b - a, 1.0), np.nan)
+    return meet.reshape(np.shape(xs))
+
+
+def set_behind(pose, z, canvas, centre, rel, size, width, height):
+    """How deep the set lies behind a person where the picture shows them (in the frame's camera,
+    shot units), or None where it cannot be told: the median of where the lines of sight through
+    their sure keypoints (SURE) meet it. Their outline was cut out of the set and closed with what
+    is around them, so whatever the set shows there is behind them. z, canvas, centre, rel, size:
+    as for on_set."""
+    kp = np.asarray(pose["kp"], np.float64)
+    sure = kp[:, 2] >= SURE
+    if sure.sum() < 3:
+        return None
+    h, w = size
+    f = LENS / 36.0 * w
+    meet = _sight((kp[sure, 0] * w / width - w / 2) / f, (kp[sure, 1] * h / height - h / 2) / f,
+                  z, canvas, centre, rel, f)
+    meet = meet[np.isfinite(meet)]
+    return float(np.median(meet)) if meet.size >= 3 else None
 
 
 def on_set(box, z, canvas, centre, rel, size, width, height):
@@ -245,23 +311,7 @@ def on_set(box, z, canvas, centre, rel, size, width, height):
     rows = np.linspace(y1 + BELOW[0] * height, y1 + BELOW[1] * height, 6) * h / height
     cols = np.linspace(x0 + 0.25 * (x1 - x0), x1 - 0.25 * (x1 - x0), 6) * w / width
     ys, xs = np.meshgrid((rows - h / 2) / f, (cols - w / 2) / f, indexing="ij")
-    rays = np.stack((xs, ys, np.ones_like(xs)), -1).reshape(-1, 1, 3)
-    d = 1.0 / np.linspace(4.0 / z, 0.25 / z, 400)        # along each line of sight, near to far
-    R, T, _ = rel
-    p = (rays * d[None, :, None] - np.asarray(T)) @ np.asarray(R)          # in the keyframe's camera
-    ahead = p[..., 2] > 1e-6
-    pz = np.where(ahead, p[..., 2], 1.0)
-    i = np.round(f * p[..., 1] / pz + centre[1] - 0.5).astype(np.int64)
-    j = np.round(f * p[..., 0] / pz + centre[0] - 0.5).astype(np.int64)
-    inside = ahead & (i >= 0) & (i < canvas.shape[0]) & (j >= 0) & (j < canvas.shape[1])
-    q = np.where(inside, canvas[np.clip(i, 0, canvas.shape[0] - 1), np.clip(j, 0, canvas.shape[1] - 1)], 0.0)
-    behind = np.where(q > 0, q * pz - 1.0, -1.0)    # >= 0 where the line of sight is at or behind the set
-    cross = (behind[:, 1:] >= 0) & (behind[:, :-1] < 0)
-    k = np.argmax(cross, axis=1)
-    n = np.arange(len(k))
-    a, b = behind[n, k], behind[n, k + 1]
-    meet = np.where(cross[n, k], d[k] + (d[k + 1] - d[k]) * -a / np.where(b > a, b - a, 1.0), np.nan)
-    inv = (1.0 / meet).reshape(len(rows), len(cols))
+    inv = 1.0 / _sight(xs, ys, z, canvas, centre, rel, f)
     # Down each column the surface runs on from row to row until an edge (a jump in depth of more
     # than BRINK). Of the pieces that leaves, the nearest is what they stand on (a step's riser
     # just below their tread, the top of a step seen from above); what lies further back is the
@@ -284,34 +334,40 @@ def on_set(box, z, canvas, centre, rel, size, width, height):
 
 
 def look(src, meta, cuts, total, work, device):
-    """First pass: depth, sky, people and background features for every frame.
+    """First pass: depth, sky, people, the things they carry and background features for every
+    frame.
 
-    Depth and masks go to a Store. Also returns the people found in each frame, the background
-    features followed through the video (camera.Tracker) and the outlining model, which is
-    needed once more."""
+    Depth and masks (people, and things where someone holds them, are taken out of the set) go to a
+    Store. Also returns the people and the things (see figures.PROPS) found in each frame, the
+    background features followed through the video (camera.Tracker) and the outlining model, which
+    is needed once more."""
     width, height = meta["width"], meta["height"]
     find_people = figures.PoseEstimator(device)
     outline = figures.Segmenter(device)
     estimate = dp.DepthEstimator(device)
-    store, people, batch = None, [], []
+    store, people, things, batch = None, [], [], []
     tracker = camera.Tracker()
 
     def flush():
         nonlocal store
-        for frame, found in zip(batch, find_people(batch)):
+        for frame, found, items in zip(batch, *find_people(batch)):
             i = len(people)
             depth, sky = estimate(frame)
             h, w = depth.shape
             if store is None:
                 store = Store(work, total, h, w)
-            outline(frame, found)
-            masks = [p.pop("mask") for p in found]
-            hole = planes.hole_mask(masks, depth)
-            for p, m in zip(found, masks):
+            outline(frame, found + items)
+            masks = [p.pop("mask") for p in found + items]
+            for p, m in zip(found + items, masks):
                 measure(p, m, depth, width, height)
+            # (a thing goes out of the set where someone holds it, as it is drawn where it goes; one that
+            # nobody holds stays part of the set)
+            hole = planes.hole_mask(masks[:len(found)] + [m for p, m in zip(items, masks[len(found):])
+                                                         if figures.held(p["box"], found)], depth)
             tracker(planes.motion_view(frame, hole, sky), i in cuts)
-            store.put(i, depth, hole, sky, dp.unlit(frame, depth.shape))
+            store.put(i, depth, hole, sky, dp.unlit(frame, depth.shape), dp.grey(frame, depth.shape))
             people.append(found)
+            things.append(items)
         batch.clear()
 
     for frame in read_frames(src, width, height):
@@ -322,16 +378,59 @@ def look(src, meta, cuts, total, work, device):
             flush()
     if batch:
         flush()
-    return store, people, tracker, outline
+    return store, people, things, tracker, outline
 
 
-def follow(people, shots):
+def follow(people, shots, width):
     """Tracks of people (see figures.track), shot by shot so none crosses a cut; "start" is
     the frame number in the whole video."""
     tracks = []
     for s, e in shots:
-        tracks += [{**t, "start": s + t["start"]} for t in figures.track(people[s:e])]
+        tracks += [{**t, "start": s + t["start"]} for t in figures.track(people[s:e], width)]
     return tracks
+
+
+def follow_things(things, people, shots):
+    """Tracks of the things people carry (see figures.track_things), shot by shot as follow's,
+    each with the "item" it is (from 1): a thing found again after it was lost (out of the
+    picture, or in the dark) or after a cut is the one of its kind (figures.KINDS) last seen,
+    unless that one is still in view, so it is drawn as one thing, in one colour."""
+    tracks = [{**t, "start": s + t["start"]} for s, e in shots for t in figures.track_things(things[s:e], people[s:e])]
+    last = {}                   # item -> its kind, and the last frame it was seen in
+    for t in tracks:            # (in the order they start)
+        kind = figures.KINDS.get(t["label"], t["label"])
+        gone = [k for k, (other, end) in last.items() if other == kind and end < t["start"]]
+        t["item"] = max(gone, key=lambda k: last[k][1]) if gone else len(last) + 1
+        last[t["item"]] = kind, t["start"] + len(t["poses"]) - 1
+    return tracks
+
+
+def place_props(tracks, factors, meta):
+    """Where each thing's track (see follow_things) is in every frame, in set depth units in the
+    camera's space (x right, y down, z forward): the middle of its box, as deep as measured inside
+    its outline (see measure; between detections, and where one is PROP_JUMP off the depth of
+    those around it, box and depth bridged from either side); and how big it is, across and up
+    (what its box typically spans at that depth). Returns per track its start, label, item,
+    centres (N, 3) and size."""
+    width, height = meta["width"], meta["height"]
+    focal = LENS / 36.0 * width
+    placed = []
+    for t in tracks:
+        n = len(t["poses"])
+        z = np.array([p.get("z", np.nan) for p in t["poses"]], np.float64) / factors[t["start"]:t["start"] + n]
+        seen = np.flatnonzero(np.isfinite(z) & (z > 0))
+        if not len(seen):
+            continue
+        around = ndimage.median_filter(z[seen], size=PROP_STEADY, mode="nearest")
+        ok = seen[np.abs(np.log(z[seen] / around)) <= np.log(PROP_JUMP)]     # (never empty: see the first)
+        box = np.array([p["box"] for p in t["poses"]], np.float64)
+        box = np.stack([np.interp(np.arange(n), ok, side) for side in box[ok].T], axis=1)
+        z = np.interp(np.arange(n), ok, z[ok])
+        u, v = (box[:, 0] + box[:, 2]) / 2, (box[:, 1] + box[:, 3]) / 2
+        span = (box[:, 2:] - box[:, :2]) * z[:, None] / focal
+        placed.append({"start": t["start"], "label": t["label"], "item": t["item"], "size": np.median(span[ok], axis=0),
+                       "centres": np.stack(((u - width / 2) / focal * z, (v - height / 2) / focal * z, z), axis=1)})
+    return placed
 
 
 def outline_missed(src, meta, tracks, store, outline):
@@ -372,7 +471,10 @@ def build_sets(store, shots, tracker, sets_dir, device):
     built from the depth of frames across it and seen from its keyframe (planes.SetDepth.splat),
     which stands still while the camera moves through it. A set is written as sets_dir/NNN.npy:
     inverse depth in the shot's units on a picture in its keyframe's view, 0 where there is none
-    (sky) and -1 where it is left empty for being too dark to see.
+    (sky) and -1 where it is left empty for being too dark to see; sets_dir/NNN_edges.npz:
+    where the pixels along its outlines lie on the straight lines the outlines were drawn as, and
+    which surface each pixel is on (planes.outline_shifts); and sets_dir/NNN_tone.png: the set
+    painted in the footage's light and dark (planes.set_tones), in one spread of greys for the shot.
     Returns per shot its camera path (camera poses), the typical distance to what the camera
     sees and its sets; and per frame the factor that took the depth model's scale to the shot's
     (shot depth = model depth / factor)."""
@@ -383,21 +485,28 @@ def build_sets(store, shots, tracker, sets_dir, device):
         n = e - s
         poses, dists = camera.path(tracker, s, e, store.get, LENS / 36.0)
         factors[s:e] = [f for _, _, f in poses]
-        sets = []
+        sets, greys = [], []
         for a, b in camera.stretches(poses, dists):
             key = camera.keyframe(poses, a, b, lambda t: store.get(s + t), LENS / 36.0)
             # Built from BLEND / 2 frames more on either side, so it matches its neighbours where they meet.
             lo, hi = max(0, a - planes.BLEND // 2), min(n, b + planes.BLEND // 2)
             got = cleaner.splat(lambda t: store.get(s + lo + t), [camera.relative(poses[t], poses[key])
                                                                  for t in range(lo, hi)], key - lo,
-                                lambda t: store.get_dark(s + lo + t))
+                                lambda t: store.get_dark(s + lo + t), lambda t: store.get_grey(s + lo + t))
             if got is None:         # no set could be built here (all people, or a whip pan): none shown
                 continue
-            depth, centre = got
+            depth, centre, grey = got
             np.save(sets_dir / f"{number:03d}.npy", depth)
+            at, across, down, moved, piece = planes.outline_shifts(depth)
+            np.savez_compressed(sets_dir / f"{number:03d}_edges.npz", at=at, across=across, down=down, q=moved,
+                                piece=piece)
+            greys.append((number, grey, depth > 0, piece))
             sets.append({"file": f"{number:03d}.npy", "first": s + a, "last": s + b - 1, "centre": centre,
                          "key": poses[key][:2]})
             number += 1
+        spread = planes.tone_spread([g for _, g, _, _ in greys])      # (one for the shot's sets)
+        for k, grey, valid, piece in greys:
+            cv2.imwrite(str(sets_dir / f"{k:03d}_tone.png"), planes.set_tones(grey, valid, piece, spread))
         info.append({"poses": [p[:2] for p in poses], "typical": float(np.median(dists)), "sets": sets})
     return info, factors
 
@@ -440,11 +549,24 @@ def pose_people(tracks, factors, meta, device, store, shots, sets, sets_dir):
         ground = np.array([on_set(p["box"], z[k], *views[t["start"] + k], store.depth.shape[1:], width, height)
                            if lines[k][1] is not None and t["start"] + k in views else None
                            for k, p in enumerate(t["poses"])], np.float64)
+        # Where the picture shows them, the set is behind them (see set_behind; where the detector
+        # missed them, as it was in the frames around): a floor further back than that is not what
+        # they stand on but one far below (someone in mid-air), and they are no deeper than it.
+        back = np.array([set_behind(p, z[k], *views[t["start"] + k], store.depth.shape[1:], width, height)
+                         if not p.get("missed") and p.get("kp") is not None and np.isfinite(z[k]) and z[k] > 0
+                         and t["start"] + k in views else None for k, p in enumerate(t["poses"])], np.float64)
+        known = np.flatnonzero(np.isfinite(back))
+        if known.size:
+            gap = np.arange(n)
+            gap = gap[(gap > known[0]) & (gap < known[-1]) & ~np.isfinite(back)]
+            back[gap] = np.interp(gap, known, back[known])
+        ground[ground > back * (1 + BEYOND)] = np.nan
         ground = np.array([np.nanmedian(ground[max(0, k - GROUND_STEADY):k + GROUND_STEADY + 1])
                            if np.isfinite(g) else np.nan for k, g in enumerate(ground)])
         both = np.isfinite(ground) & np.isfinite(z) & (z > 0)
         if both.any():
             z = np.where(np.isfinite(ground), ground, z * np.median(ground[both] / z[both]))
+        z = np.where(~np.isfinite(ground) & (z > back * (1 - FRONT)), back * (1 - FRONT), z)
         ok = np.isfinite(z) & (z > 0)
         if not ok.any():
             continue
@@ -484,10 +606,12 @@ def quaternions(m):
     return out
 
 
-def assemble(shots, info, fitted, depth_shape, frames):
+def assemble(shots, info, fitted, depth_shape, frames, props=()):
     """scene.json's contents: everything in metres, in the scene's space (see TO_SCENE), which
-    for each shot is the space of its first frame's camera. Blender frames start at 1."""
-    out_sets, out_figures, cam_loc, cam_rot = [], [], [], []
+    for each shot is the space of its first frame's camera. Blender frames start at 1. props:
+    the things people carry (see place_props), each kept upright and turned as the camera is in
+    the middle of its track, its path the median of where it was found over PROP_STEADY frames."""
+    out_sets, out_figures, out_props, cam_loc, cam_rot = [], [], [], [], []
     focal = LENS / 36.0 * depth_shape[1]                    # in pixels of the sets' pictures
     for number, ((s, e), shot) in enumerate(zip(shots, info)):
         mine = [f for f in fitted if s <= f["start"] < e]
@@ -516,8 +640,19 @@ def assemble(shots, info, fitted, depth_shape, frames):
                 parts[name] = {"loc": np.round(world @ TO_SCENE.T * metres, 4).tolist(),
                                "rot": np.round(quaternions(TO_SCENE @ turns[k] @ axes), 5).tolist()}
             out_figures.append({"start": f["start"] + 1, "size": float(f["scale"] * metres), "parts": parts})
+        for p in props:
+            if not s <= p["start"] < e:
+                continue
+            k = p["start"] - s + np.arange(len(p["centres"]))
+            world = np.einsum("nij,nj->ni", turns[k], p["centres"] - shifts[k]) @ TO_SCENE.T * metres
+            world = ndimage.median_filter(world, size=(PROP_STEADY, 1), mode="nearest")
+            mid = k[len(k) // 2]
+            out_props.append({"label": p["label"], "item": p["item"], "start": p["start"] + 1,
+                              "size": np.round(np.asarray(p["size"]) * metres, 4).tolist(),
+                              "loc": np.round(world, 4).tolist(),
+                              "rot": np.round(quaternions((TO_SCENE @ turns[mid] @ TO_SCENE.T)[None])[0], 5).tolist()})
     return {"lens": LENS, "frames": frames, "camera": {"loc": cam_loc, "rot": cam_rot}, "sets": out_sets,
-            "part_sizes": mannequin.PART_SIZES, "figures": out_figures}
+            "part_sizes": mannequin.PART_SIZES, "figures": out_figures, "props": out_props}
 
 
 def main(job_dir):
@@ -532,15 +667,16 @@ def main(job_dir):
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir()
     sets_dir.mkdir(exist_ok=True)
-    for old in sets_dir.glob("*.npy"):
+    for old in [*sets_dir.glob("*.npy"), *sets_dir.glob("*.npz"), *sets_dir.glob("*.png")]:
         old.unlink()
     store = None
     try:
-        store, people, tracker, outline = look(src, meta, cuts, total, work, device)
+        store, people, things, tracker, outline = look(src, meta, cuts, total, work, device)
         n = len(people)
         cuts = [c for c in cuts if c < n]
         shots = list(zip(cuts, cuts[1:] + [n]))
-        tracks = follow(people, shots)
+        tracks = follow(people, shots, meta["width"])
+        carried = follow_things(things, people, shots)
         missed = outline_missed(src, meta, tracks, store, outline)
         del outline
         torch.cuda.empty_cache()
@@ -548,14 +684,14 @@ def main(job_dir):
         sets, factors = build_sets(store, shots, tracker, sets_dir, device)
         built = time.time()
         fitted = pose_people(tracks, factors, meta, device, store, shots, sets, sets_dir)
-        scene = assemble(shots, sets, fitted, store.depth.shape[1:], n)
+        scene = assemble(shots, sets, fitted, store.depth.shape[1:], n, place_props(carried, factors, meta))
     finally:
         if store is not None:
             store.close()
         shutil.rmtree(work, ignore_errors=True)
     (job_dir / "scene.json").write_text(json.dumps(scene), encoding="utf-8")
-    print(f"analyse: {n} frames, {len(shots)} shot(s) ({len(scene['sets'])} sets), "
-          f"{len(fitted)} figure(s), {missed} missed detections outlined; on {device}: people and depth "
+    print(f"analyse: {n} frames, {len(shots)} shot(s) ({len(scene['sets'])} sets), {len(fitted)} figure(s), "
+          f"{len(scene['props'])} prop(s), {missed} missed detections outlined; on {device}: people and depth "
           f"{seen - clock:.0f} s, set {built - seen:.0f} s, figures {time.time() - built:.0f} s")
 
 

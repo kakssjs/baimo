@@ -3,11 +3,12 @@ so that its joints land on the person's keypoints in the picture.
 
 The body is a rigid torso, a head that turns on it, and two-part arms and legs of fixed length.
 Its pose in every frame of a track is found together by gradient descent, which also keeps the
-motion smooth, keeps knees and elbows bending the right way and, where the picture shows no
-limb (out of frame, hidden), lets it hang down in a natural rest position. Nothing of it reaches
-below the floor it is seen on, so a body whose legs the picture misses kneels or crawls there
-rather than standing through the floor. The whole body is always there, with the same
-proportions from the first frame to the last.
+motion smooth, keeps knees and elbows bending the right way and, where the picture does not show
+a limb (hidden, blurred, out of frame), holds it as it was seen just before or after (an arm
+still pointing, a leg still mid-stride), or lets it hang down in a natural rest position when it
+goes unseen for longer. Nothing of it reaches below the floor it is seen on, so a body whose legs
+the picture misses kneels or crawls there rather than standing through the floor. The whole body
+is always there, with the same proportions from the first frame to the last.
 
 Positions are in the camera's space (x right, y down, z forward) in the units of the depth maps;
 analyse.py turns them into metres.
@@ -30,6 +31,9 @@ LIMBS = [(5, 7, 0.29, (0.15, -1.0, 0.0)), (7, 9, 0.26, (0.0, -1.0, 0.3)),
          (11, 13, 0.42, (0.03, -1.0, 0.05)), (13, 15, 0.42, (0.0, -1.0, -0.08)),
          (12, 14, 0.42, (-0.03, -1.0, 0.05)), (14, 16, 0.42, (0.0, -1.0, -0.08))]
 MIN_SCORE = 0.3     # keypoints scored lower are ignored
+REMEMBER = 24       # a limb the picture does not show keeps the pose (relative to the body) it is seen in at most this
+                    # many frames before or after, between the two where it is seen on both sides; further from any
+                    # sight of it, it hangs
 FLOOR_SLACK = 0.03  # the joints may reach this share of the box's height below its floor line
 HOLD_GROW, HOLD_SHRINK = 5.0, 50.0  # how firmly the body keeps its size: foreshortening only ever makes a body
                                     # look smaller, so it grows more readily than it shrinks (it folds instead)
@@ -261,6 +265,21 @@ def fit(track, focal, width, height, device, scale=None):
         hang[:, shins] = -R[:, None, :, 1]
         return _unit((R[:, None] @ side[None, :, :, None])[..., 0] + hang)
 
+    # Where the picture shows each limb (both its ends), and for the frames where it does not, the
+    # nearest frames before and after (within REMEMBER) where it does, and how much each counts.
+    shown = np.stack([good[:, a] & good[:, b] for a, b, *_ in LIMBS], 1)
+    at_t = np.arange(n)[:, None]
+    before = np.maximum.accumulate(np.where(shown, at_t, -1), axis=0)
+    after = np.minimum.accumulate(np.where(shown, at_t, n)[::-1], axis=0)[::-1]
+    near_b, near_a = (before >= 0) & (at_t - before <= REMEMBER), (after < n) & (after - at_t <= REMEMBER)
+    span = np.maximum(after - before, 1)
+    hold = torch.tensor(~shown & (near_b | near_a), device=dev)
+    w_before = T(np.where(near_b & near_a, (after - at_t) / span, near_b))[..., None]
+    w_after = T(np.where(near_b & near_a, (at_t - before) / span, near_a))[..., None]
+    before = torch.tensor(np.clip(before, 0, n - 1).copy(), device=dev)
+    after = torch.tensor(np.clip(after, 0, n - 1).copy(), device=dev)
+    limbs = torch.arange(len(LIMBS), device=dev)
+
     with torch.no_grad():
         u0 = hanging(_rotation(r))
     u = u0.clone().requires_grad_()
@@ -313,7 +332,12 @@ def fit(track, focal, width, height, device, scale=None):
         for k, on in known.items():
             miss = _robust((extent[k] - edge[k]) / norm[:, 0], 0.03)
             loss = loss + (miss * on).sum() / on.sum().clamp_min(1.0) * 1e3
-        want = hanging(R)                                       # (limbs hang down)
+        want = hanging(R)                                       # (limbs hang down ...)
+        with torch.no_grad():                                   # (... or, unseen, keep the pose they are seen in)
+            body_dirs = (R.transpose(-1, -2)[:, None] @ dirs[..., None])[..., 0]
+            then = _unit(w_before * body_dirs[before, limbs] + w_after * body_dirs[after, limbs])
+            held = (R[:, None] @ then[..., None])[..., 0]
+        want = torch.where(hold[..., None], held, want)
         loss = loss + 0.05 * ((dirs - want) ** 2).sum(-1).mean()
         left = R[..., 0]
         knees = torch.cross(dirs[:, [4, 6]], dirs[:, [5, 7]], dim=-1)
