@@ -18,6 +18,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from scipy import ndimage
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 
 TOLERANCE = 0.02      # a pixel lies on a plane when its depth is within 2% of the plane's ...
 ANGLE = 14.0          # ... and its surface turns less than this many degrees away from it
@@ -63,6 +65,20 @@ TONE_SPECK = 2e-4     # (once an even fall of light across it is taken out), ove
 TONE_ROUND = 0.003    # picture, its outline rounded with a disc of this share of the picture's width (a whole
                       # shape, not a fringe of specks), is a part of its own with its own grey: a window's panes, a
                       # door's panels, a lamp on a wall
+TONE_CORE = 0.5       # a part is where it stands out by at least this share of what it stands out by at most (its
+                      # 95th percentile): all of an even pane or panel, a lamp without the glow around it
+TONE_SOLID = 0.85     # a part that fills at least this share of the convex outline around it is drawn as that
+                      # outline: a lamp round, a pane straight-sided, not the ragged edge the footage gives them
+LINE_STEP = 0.06      # the set's straight edges (window frames, door and panel outlines, rails, floor tiles: the
+LINE_LEN = 0.03       # footage's grey changing across a straight line by at least this share of the spread, the
+LINE_WIDTH = 0.003    # same surface on both sides, the line at least this share of the picture's width long) are
+                      # drawn on it as lines this wide, a grey darker (lighter on the darkest grey), so its windows,
+                      # doors and panels keep their outlines where their greys are too close to show them
+LINE_JOIN = (3.0, 0.03)   # pieces of one line the detector finds apart (in line to within this many degrees and a
+                          # line's width, at most this share of the picture's width apart) are joined first
+LINE_CROWD = (0.04, 5.0)  # a line crossing a square this share of the picture's width wide with more than this many
+                          # lines on average is hatching (the grain of a surface, a far facade's rows of windows,
+                          # a radiator's fins), not an outline, and is not drawn
 CREASE_GAP = 0.03     # planes that meet at an angle (CREASE_ANGLE or more apart) and lie within this share of
 CREASE_ANGLE = 10.0   # each other in depth along their seam are cut along the line where they meet (a room's
 CREASE_REACH = 0.02   # corner, a box's edge), where it runs within this share of the frame width of the seam
@@ -360,6 +376,12 @@ def _disc(radius):
     return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
 
 
+def _rounded(mask, disc):
+    """A mask (bool) opened, then closed, with a disc: whole, rounded shapes, no specks or fringes."""
+    return cv2.morphologyEx(cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN, disc), cv2.MORPH_CLOSE,
+                            disc).astype(bool)
+
+
 def _along(polygon, dirs, centre, f, reach):
     """A plane's outline (polygon: m x 2 pixel positions, x then y) with every side that runs within
     SNAP degrees of one of the directions dirs (rows, in the camera's space) laid along it through the
@@ -511,12 +533,15 @@ def set_tones(g, valid, piece, spread):
     levels (g, see SetDepth.splat: nan where not seen; valid where there is a set) spread over
     TONE_RANGE from spread's low to its high (see tone_spread); each surface (piece: a number per
     pixel, see outline_shifts) the median grey seen on it, as a set builder paints a wall, and
-    each part of it that stands out from the rest (see TONE_EDGE) the median grey seen on that
-    part, each rounded to the nearest of the TONES. So walls, floors and steps come out even,
-    with no blotches where the light fell unevenly, and windows, doors, lamps and rails keep the
-    footage's light and dark. What was not seen (behind people throughout) takes the grey of the
-    nearest of its own surface that was, so no outline of them shows."""
+    each part of it that stands out from the rest (see TONE_EDGE; trimmed to its core, TONE_CORE)
+    the median grey seen on that part, each rounded to the nearest of the TONES, a part that is
+    nearly convex drawn as its convex outline (TONE_SOLID). So walls, floors and steps come out
+    even, with no blotches where the light fell unevenly, and windows, doors, lamps and rails keep
+    the footage's light and dark. What was not seen (behind people throughout) takes the grey of
+    the nearest of its own surface that was, so no outline of them shows. The set's straight edges
+    are drawn on it as lines (see LINE_STEP, straight_edges)."""
     ok = valid & np.isfinite(g)
+    observed = ok.copy()
     if not ok.any():
         return np.full(g.shape, round(np.mean(TONE_RANGE) * 255), np.uint8)
     lo, hi = spread
@@ -542,14 +567,28 @@ def set_tones(g, valid, piece, spread):
     # (TONE_ROUND): parts of their own.
     part = np.zeros(t.shape, np.int64)
     disc = _disc(max(1, round(TONE_ROUND * t.shape[1])))
-    for side in (t - trend >= TONE_EDGE, trend - t >= TONE_EDGE):
-        side = cv2.morphologyEx(cv2.morphologyEx((side & (lab > 0)).astype(np.uint8), cv2.MORPH_OPEN, disc),
-                                cv2.MORPH_CLOSE, disc).astype(bool) & (lab > 0)
+    for dev in (t - trend, trend - t):          # (lighter parts, then darker)
+        side = _rounded((dev >= TONE_EDGE) & (lab > 0), disc) & (lab > 0)
         cc = ndimage.label(side)[0]
         key = np.where(cc > 0, cc * n + lab, 0)        # (one part per surface it lies on)
         _, inverse, sizes = np.unique(key, return_inverse=True, return_counts=True)
         big = (sizes >= TONE_SPECK * t.size)[inverse.reshape(key.shape)] & (key > 0)
-        part[big] = part.max() + 1 + inverse.reshape(key.shape)[big]
+        new = np.where(big, inverse.reshape(key.shape) + 1, 0)
+        for k, box in enumerate(ndimage.find_objects(new), 1):
+            if box is None:
+                continue
+            own = new[box] == k
+            core = own & (dev[box] >= TONE_CORE * np.percentile(dev[box][own], 95))     # (a lamp, not its glow,
+            own &= _rounded(core, disc)                                                 # rounded as the part was)
+            new[box][(new[box] == k) & ~own] = 0
+            if own.sum() < TONE_SPECK * t.size:         # (a glow with no core to speak of)
+                new[box][own] = 0
+                continue
+            hull = np.zeros(own.shape, np.uint8)
+            cv2.fillConvexPoly(hull, cv2.convexHull(cv2.findNonZero(own.astype(np.uint8))), 1)
+            if own.sum() >= TONE_SOLID * hull.sum():    # (on its own surface, where no other part is)
+                new[box][(hull > 0) & (lab[box] == lab[box][own][0]) & (part[box] == 0) & (new[box] == 0)] = k
+        part = np.where(new > 0, part.max() + new, part)
     region = np.where(part > 0, part + n, lab)          # (surfaces 1..n-1, parts beyond)
     region = np.unique(region, return_inverse=True)[1].reshape(t.shape)
     count = np.bincount(region.ravel())
@@ -571,7 +610,85 @@ def set_tones(g, valid, piece, spread):
     if not ok.all():            # (a surface never seen, and around the set: the nearest seen, so the
         _, (iy, ix) = ndimage.distance_transform_edt(~ok, return_indices=True)     # edges blend with
         out = out[iy, ix]                                                           # nothing else)
+    step = (TONE_RANGE[1] - TONE_RANGE[0]) / (TONES - 1)
+    out = np.where(straight_edges(t, observed, piece),
+                   np.where(out > TONE_RANGE[0] + step / 2, out - step, out + step), out)
     return np.round(out * 255).astype(np.uint8)
+
+
+def straight_edges(t, seen, piece):
+    """Where the set's straight edges run, to draw (see LINE_STEP): the lines a line segment
+    detector finds in its grey (t, 0..1; seen: where it was seen, the rest as the nearest seen, so
+    no edge runs along people), kept where the grey differs across them by LINE_STEP and both
+    sides were seen on one surface (piece; where two surfaces meet, the set shows it), joined
+    (LINE_JOIN) and at least LINE_LEN long; a mask of lines LINE_WIDTH wide, where seen."""
+    h, w = t.shape
+    mask = np.zeros((h, w), np.uint8)
+    if not seen.any():
+        return mask.astype(bool)
+    _, (iy, ix) = ndimage.distance_transform_edt(~seen, return_indices=True)
+    found = cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD).detect(np.round(t[iy, ix] * 255).astype(np.uint8))[0]
+    off = max(2.0, 1.25 * LINE_WIDTH * w)       # (pixels either side at which each side's grey is read)
+    keep = []
+    for seg in (np.zeros((0, 4)) if found is None else found.reshape(-1, 4)):
+        d = np.hypot(seg[2] - seg[0], seg[3] - seg[1])
+        if d < LINE_LEN * w / 4:                # (a speck, not a piece of a line)
+            continue
+        s = np.linspace(0.1, 0.9, max(5, int(d / 3)))
+        x, y = seg[0] + s * (seg[2] - seg[0]), seg[1] + s * (seg[3] - seg[1])
+        nx, ny = -(seg[3] - seg[1]) / d, (seg[2] - seg[0]) / d
+        (ax, ay), (bx, by) = [(np.clip(np.round(x + k * off * nx).astype(int), 0, w - 1),
+                               np.clip(np.round(y + k * off * ny).astype(int), 0, h - 1)) for k in (1, -1)]
+        both = seen[ay, ax] & seen[by, bx]
+        if (both.mean() >= 0.8 and np.mean(piece[ay, ax][both] == piece[by, bx][both]) >= 0.7
+                and abs(np.median(t[ay, ax][both]) - np.median(t[by, bx][both])) >= LINE_STEP):
+            keep.append(seg)
+    lines = [np.round(s).astype(int) for s in _join(np.array(keep, np.float64).reshape(-1, 4), w)
+             if np.hypot(s[2] - s[0], s[3] - s[1]) >= LINE_LEN * w]
+    thin = np.zeros((h, w), np.float32)
+    for x0, y0, x1, y1 in np.round(keep).astype(int).reshape(-1, 4):     # (every piece: grain is many short ones)
+        cv2.line(thin, (x0, y0), (x1, y1), 1.0, 1)
+    size = max(3, round(LINE_CROWD[0] * w))
+    crowd = cv2.boxFilter(thin, -1, (size, size)) * size        # (about how many lines cross the square)
+    for x0, y0, x1, y1 in lines:
+        s = np.linspace(0, 1, 20)           # (a joined line can end a little beyond the picture)
+        along = (np.clip(np.round(y0 + s * (y1 - y0)).astype(int), 0, h - 1),
+                 np.clip(np.round(x0 + s * (x1 - x0)).astype(int), 0, w - 1))
+        if np.mean(crowd[along]) <= LINE_CROWD[1]:
+            cv2.line(mask, (x0, y0), (x1, y1), 1, max(1, round(LINE_WIDTH * w)))
+    return mask.astype(bool) & seen
+
+
+def _join(segs, w):
+    """Pieces of one straight line (segs: x0, y0, x1, y1 each) joined into one segment over all of
+    them (see LINE_JOIN): those in line with each other, near enough end to end, linked in turn."""
+    if len(segs) < 2:
+        return segs
+    p, q = segs[:, :2], segs[:, 2:]
+    length = np.linalg.norm(q - p, axis=1)
+    u = (q - p) / length[:, None]
+    across = np.stack([-u[:, 1], u[:, 0]], axis=1)
+    pairs = []
+    for s in range(0, len(segs), 512):          # (i in blocks: thousands of pieces at once would not fit in memory)
+        i = slice(s, s + 512)
+        rel_p, rel_q = p[None] - p[i, None], q[None] - p[i, None]          # (j's ends from i's start)
+        off = np.maximum(np.abs(np.einsum("ik,ijk->ij", across[i], rel_p)),
+                         np.abs(np.einsum("ik,ijk->ij", across[i], rel_q)))
+        a, b = np.einsum("ik,ijk->ij", u[i], rel_p), np.einsum("ik,ijk->ij", u[i], rel_q)
+        gap = np.maximum(np.minimum(a, b) - length[i, None], -np.maximum(a, b))     # (along i's line; < 0: overlap)
+        rows, cols = np.nonzero((np.abs(u[i] @ u.T) >= np.cos(np.radians(LINE_JOIN[0])))
+                                & (off <= max(1.0, LINE_WIDTH * w)) & (gap <= LINE_JOIN[1] * w))
+        pairs.append(np.stack([rows + s, cols]))
+    rows, cols = np.concatenate(pairs, axis=1)
+    near = coo_matrix((np.ones(len(rows)), (rows, cols)), shape=(len(segs),) * 2).tocsr()
+    _, group = connected_components(near.multiply(near.T), directed=False)     # (near each other both ways)
+    out = []
+    for k in np.unique(group):
+        members = np.flatnonzero(group == k)
+        i = members[np.argmax(length[members])]         # (along the longest of them)
+        along = np.concatenate([(p[members] - p[i]) @ u[i], (q[members] - p[i]) @ u[i]])
+        out.append(np.concatenate([p[i] + along.min() * u[i], p[i] + along.max() * u[i]]))
+    return out
 
 
 def motion_view(frame, hole, sky):

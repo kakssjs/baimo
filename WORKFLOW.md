@@ -234,10 +234,29 @@ correlates with the one before it; nothing is carried across a cut.
   light across the surface is taken out, gets the median grey seen on that part: a window's
   panes, a door's panels, a radiator or a lamp on a wall. Its outline is rounded off first with
   a disc 0.3% of the picture's width in radius (so it is one whole shape, not a fringe of
-  specks), and it must then cover at least 0.02% of the picture. Each grey is then rounded to
-  the nearest of the 6, from 0.12 (dark grey) to 0.7 (light grey) albedo. A spot that was
-  behind people throughout takes the grey of the nearest spot of its own surface that was seen,
-  so no outline of them shows.
+  specks), and it must then cover at least 0.02% of the picture. It is then trimmed to its core,
+  where it stands out by at least half of what it stands out by at most (its 95th percentile),
+  rounded off again: all of an even pane or panel stays, but a lamp loses the glow around it and
+  is a small, clean shape, and a glow with no core to speak of is no part at all. A part that
+  fills at least 85% of the convex outline around it is drawn as that outline, so a lamp is
+  round and a pane straight-sided rather than ragged. Each grey is then rounded to the nearest
+  of the 6, from 0.12 (dark grey) to 0.7 (light grey) albedo. A spot that was behind people
+  throughout takes the grey of the nearest spot of its own surface that was seen, so no outline
+  of them shows.
+- **Lines.** In dim footage a window's frames and panes, a door's panels or a floor's tiles
+  differ by less than one of the 6 greys, so the greys alone would paint them over. The set's
+  straight edges are therefore drawn on it as lines (`planes.straight_edges`): a line segment
+  detector reads the set's greys (spots behind people throughout taken as the nearest seen
+  spot, so no edge runs along a person's outline); a piece is kept where the grey a little more
+  than a line's width (at least 2 pixels) either side of it differs by at least 6% of the spread
+  and both sides were seen on one surface (where two surfaces meet, the set shows it already);
+  pieces in line to within 3° and a line's width, at most 3% of the picture's width apart, are
+  joined into one line, and lines at least 3% of the picture's width long are drawn 0.3% of it
+  wide, one grey darker than the surface (one lighter on the darkest grey). A line is left out
+  where, in a square 4% of the picture's width across, more than 5 pieces cross on average along
+  it: that is the grain of a surface, a far facade's rows of windows or a radiator's fins
+  (hatching), not an outline. So windows, doors, panels, rails and floor tiles keep crisp,
+  straight outlines, and no blotches or scratches come with them.
 - **Hand-over.** Each set is shown for its own stretch and stands perfectly still while the
   camera moves through it; where one stretch ends, the next set takes over in a single frame.
   Each set is also built from the 6 frames on either side of its stretch, so neighbours match
@@ -503,7 +522,8 @@ in `WB/Props` (`Prop_01_suitcase`, …), each with its own material, to swap for
 | Where figures stand, and how firmly they keep their size and depth | `OPEN_EDGE`, `BELOW`, `OCCLUDER`, `BRINK`, `GROUND_SPAN`, `GROUND_STEADY`, `FLOOR_SPAN`, `TOUCH`, `NEARER`, `PAST`, `SURE`, `FRONT`, `BEYOND` in `pipeline/analyse.py`; `FLOOR_SLACK`, `HOLD_GROW`, `HOLD_SHRINK`, `GROW_LIMIT`, `BRIDGED`, `DEPTH_LOOSE`, `DEPTH_FIRM` in `pipeline/mannequin.py` |
 | When a figure starts out on all fours, and which way it faces | `CRAWL`, `CRAWL_SPAN`, `FACING` in `pipeline/mannequin.py` |
 | Figure proportions and part sizes | `HEIGHT`, `TORSO`, `LIMBS`, `PART_SIZES`, `TORSO_CENTRE`, `LIMB_PARTS` in `pipeline/mannequin.py` |
-| How many greys the set is painted in, how dark and light, and which parts of a surface get a grey of their own | `TONES`, `TONE_RANGE`, `TONE_CLIP`, `TONE_EDGE`, `TONE_SPECK`, `TONE_ROUND` in `pipeline/planes.py` |
+| How many greys the set is painted in, how dark and light, and which parts of a surface get a grey of their own | `TONES`, `TONE_RANGE`, `TONE_CLIP`, `TONE_EDGE`, `TONE_SPECK`, `TONE_ROUND`, `TONE_CORE`, `TONE_SOLID` in `pipeline/planes.py` |
+| Which straight edges are drawn on the set as lines, and how wide | `LINE_STEP`, `LINE_LEN`, `LINE_WIDTH`, `LINE_JOIN`, `LINE_CROWD` in `pipeline/planes.py` |
 | Which things count as carried (what, how sure, how big, held by whom), and when two tracks are one thing | `PROPS`, `MIN_PROP_SCORE`, `MIN_PROP_SIZE`, `MAX_PROP_AREA`, `PROP_PERSON`, `PROP_TRACK_SCORE`, `SAME_THING`, `KINDS`, `SAME_KIND`, `CARRIED`, `HOLD`, `CARRIER` in `pipeline/figures.py`; how steady their path is, and which depth readings are taken as misses: `PROP_STEADY`, `PROP_JUMP` in `pipeline/analyse.py` |
 | Figure, visor, prop and set colours; how bright the render is; prop shapes; bevel; which set squares become one face | `FIGURE_COLOUR`, `VISOR_COLOUR`, `PROP_COLOURS`, `EXPOSURE`, `ROUND`, `UPRIGHT`, `PROP_DEPTH`, `SET_COLOUR`, `BEVEL`, `BLOCK`, `FLAT`, `EDGE_ON`, `BACK`, `LEDGE`, `LEDGE_GAP` in `pipeline/blender/build_scene.py` |
 | Light and render samples | the light and render sections at the end of `build_scene.py` |
@@ -557,6 +577,36 @@ The full error text of a failed job is in `jobs/<id>/job.json`.
 ---
 
 ## 8. What was verified
+
+**The set's outlines** (2026-11-25, on the same RTX 5060 laptop GPU). In the hall's counter
+shot (frames 490–787) the back wall's three window openings, the door frames, the coat-check
+sign and the counter's rail lay within one of the 6 greys, so the set painted the wall one flat
+grey with a few blotches where the pendant lamps hung; the reference shows framed windows,
+panelled doors and round lamps. They are now drawn as lines (see Lines above), and the lamps as
+small round shapes without their glow.
+
+- **Through the website.** After a restart, the same video went through the website again, to
+  `final.mp4` (1280×1832, 787 frames, 30 fps, with sound) and `white.mp4` (1280×916, 787
+  frames) in 749 s: 589 s to the Blender scene, 160 s rendering and combining. It has the same
+  5 sets (3, 1, 1), 7 figures and the briefcase as one item in three stretches. Laid beside the
+  film and the reference at eight frames covering every shot, the counter wall shows its window
+  frames, cornice, lamps, sign and rail, and the first shot keeps its stair window, railing and
+  steps.
+- **No flicker added.** On the command line, the change between ordinary frames of the hall
+  stays 0.8 grey levels (median), and where one set hands over to the next (frames 232→233 and
+  315→316) 15.4 and 10.6 (before 15.8 and 10.6).
+- **All four test clips.** All 42 sets of the four clips were painted with this code, at most
+  6.4 s a set. One first failed: on the rooftop clip a joined line ended a pixel beyond the
+  picture; that is now clipped. The lines show the studio's window, planks and lumber and the
+  corridor's pipes; the rooftop clip's blurred facades give some lines too.
+- **Still missing.** The doors' panels in the first shot's dark hall: no straight edge is found
+  there, even with the contrast raised. The right-hand lamp at frames 262–314 lies on a piece of
+  set turned away from the light, so it is shaded mid-grey. Where the stair window's bars cross,
+  the footage's grey shows light knots, and they are kept.
+- The hall's command-line test clip is a separate encode of the same crop, so its sets hand over
+  in the first shot at slightly different frames (232→233 and 315→316) from the website's
+  (229→230 and 302→303); a test job made from the website's own `source.mp4` reproduces the
+  website's five set paintings exactly.
 
 Checked on 2026-11-24 with an RTX 5060 laptop GPU (8 GB).
 

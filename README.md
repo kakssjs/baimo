@@ -32,8 +32,12 @@ with the same framing, camera moves and timing, and a comparison film:
   the grey the footage shows it in (six greys in all, from dark to light), and each part of it
   that stands out from the rest (a window's panes, a door's panels, a lamp on a wall) its own
   grey, so the set keeps its windows, doors, lamps, rails and darker and lighter walls, with no
-  blotches where the light fell unevenly. The greys are the same in every set of a shot, so a
-  wall keeps its grey as the camera moves on. Every surface is shaded flat, like the boards of a
+  blotches where the light fell unevenly; a part that is nearly convex (a pane, or a lamp without
+  the glow around it) is drawn as a clean round or straight-sided shape. The set's straight
+  edges (window frames, door and panel outlines, rails, floor tiles) are drawn on it as crisp
+  lines one grey darker, so they keep their outlines even where the footage is too dim for the
+  greys to tell them apart. The greys are the same in every set of a shot, so a wall keeps its
+  grey as the camera moves on. Every surface is shaded flat, like the boards of a
   hand-built set: Blender renders the figures' soft shadows on it, but the set casts none on
   itself.
 - **Build the set through the dark.** Where the footage is too dark to see, the walls, floors and
@@ -85,9 +89,11 @@ with the same framing, camera moves and timing, and a comparison film:
 - Irregular things (coats, plants, a lamp) become flat cards in their own outline, not their
   real shape, and dark, blurry or very low-resolution footage yields fewer, rougher planes.
   Stairs are made even only where their risers face the camera (looking up a straight flight);
-  seen from above, or winding, they keep the planes found. What is built
-  through the dark is the surfaces around it carried on, not what is really there, and a dark
-  void is a flat backdrop with no depth.
+  seen from above, or winding, they keep the planes found. Only the straight edges the footage
+  shows clearly are drawn as lines: detail too dim to tell apart (a door's panels in a dark hall)
+  is left out, and a lamp on a piece of set turned away from the light is shaded darker than it
+  is. What is built through the dark is the surfaces around it carried on, not what is really
+  there, and a dark void is a flat backdrop with no depth.
 - Where a long camera move passes from one set to the next (at least 24 frames apart), the set
   changes in a single frame: each set is cut into panels on its own, so some panels jump a
   little.
