@@ -84,6 +84,24 @@ correlates with the one before it; nothing is carried across a cut.
   is dropped under a fifth.
 - Where a kept person was missed, SAM 2 outlines them again inside the bridged box, so they are
   still taken out of the set there.
+- A kept track is carried on, before its first frame and after its last, through the people the
+  detector found less surely: boxes it was at least 10% sure of (too unsure to start a track of
+  their own) and boxes no track took. A box that overlaps the track's last by half, with
+  keypoints as sure as a track's, carries it on to its frame; the frames between are bridged, at
+  most 24 in a row without such a box, not counting frames where the track's box lies at least
+  80% inside someone else's (hidden behind them). A box that holds half of someone else's box
+  (theirs, boxed loosely with the dark around them), that lies on their body with their
+  keypoints, or that the frame's sides or top cut (within 1% of the left, right or top edge: a
+  door's edge, or a body flying past the lens, can pass for someone there; the bottom edge cuts
+  the legs of anyone near the camera in an ordinary shot, and is allowed) never carries a track
+  on, and a track ends where its own box holds half of someone else's. So someone in the dark, or half
+  hidden behind someone else, keeps their figure while the detector can barely tell them from
+  the floor: the second man crawling at the hall's counter is followed for 238 frames instead
+  of 45.
+  Carried frames keep the keypoints of the box that carried them, and are outlined to measure
+  their depth, but are not taken out of the set: the camera's path is found from what each frame
+  leaves (see *The camera path is an estimate* in section 9), and boxes this unsure would move
+  it, and every set built along it, for little gain (they were left in before).
 
 *Between passes: one track per thing carried* (`figures.track_things`).
 
@@ -305,7 +323,10 @@ correlates with the one before it; nothing is carried across a cut.
   picture shows them, the set is behind them (their outline was cut out of it and closed with
   what was behind them): it is found along the lines of sight through the keypoints the pose
   model is at least 50% sure of (the median of where they meet the set), and taken from the
-  frames either side where the detector missed them. A floor more than 10% further back than
+  frames either side where the detector missed them. So it is where the detector missed them
+  behind someone else, their box lying at least half inside that person's over most of the
+  second around (25 frames): their outline's depth there is that person's as much as theirs, as
+  the depth model blurs the two together. A floor more than 10% further back than
   that is not what they stand on but one far below (someone in mid-air over a roof's edge), and
   where they stand on no floor they stand at least 5% of its depth in front of it, so their
   figure is never hidden inside a wall. The top of a
@@ -524,9 +545,9 @@ in `WB/Props` (`Prop_01_suitcase`, …), each with its own material, to swap for
 | How a shot is split into sets, and how each is built | `STRETCH_TURN`, `STRETCH_TRAVEL`, `MIN_STRETCH` in `pipeline/camera.py`; `CANVAS`, `NEAREST`, `SHOT_SAMPLES`, `SEEN`, `BLEND` in `pipeline/planes.py` |
 | Assumed lens (changes how deep the scene looks) | `LENS` in `pipeline/analyse.py` |
 | Which detections count (confidence, minimum size) | `MIN_PERSON_SCORE`, `MIN_HEIGHT` in `pipeline/figures.py` |
-| Which tracks count, and when two tracks are one person | `MIN_TRACK`, `TRACK_SCORE`, `TRACK_KEYPOINTS`, `POLE`, `SIDE`, `MAX_GAP`, `STITCH_GAP`, `STITCH_REACH`, `SAME_TRACK`, `SAME_POSE`, `SAME_PART` in `pipeline/figures.py` |
+| Which tracks count, how far they are carried on through less sure detections, and when two tracks are one person | `MIN_TRACK`, `TRACK_SCORE`, `TRACK_KEYPOINTS`, `POLE`, `SIDE`, `MAX_GAP`, `STITCH_GAP`, `STITCH_REACH`, `SAME_TRACK`, `SAME_POSE`, `SAME_PART`, `FAINT_SCORE`, `FAINT_IOU`, `HIDDEN`, `HOLDS` in `pipeline/figures.py` |
 | Which keypoints the figures follow, and how long an unseen limb keeps the pose it was seen in | `MIN_SCORE`, `REMEMBER` in `pipeline/mannequin.py` |
-| Where figures stand, and how firmly they keep their size and depth | `OPEN_EDGE`, `BELOW`, `OCCLUDER`, `BRINK`, `GROUND_SPAN`, `GROUND_STEADY`, `FLOOR_SPAN`, `TOUCH`, `NEARER`, `PAST`, `SURE`, `FRONT`, `BEYOND` in `pipeline/analyse.py`; `FLOOR_SLACK`, `HOLD_GROW`, `HOLD_SHRINK`, `GROW_LIMIT`, `BRIDGED`, `DEPTH_LOOSE`, `DEPTH_FIRM` in `pipeline/mannequin.py` |
+| Where figures stand, and how firmly they keep their size and depth | `OPEN_EDGE`, `BELOW`, `OCCLUDER`, `BRINK`, `GROUND_SPAN`, `GROUND_STEADY`, `FLOOR_SPAN`, `MERGED`, `TOUCH`, `NEARER`, `PAST`, `SURE`, `FRONT`, `BEYOND` in `pipeline/analyse.py`; `FLOOR_SLACK`, `HOLD_GROW`, `HOLD_SHRINK`, `GROW_LIMIT`, `BRIDGED`, `DEPTH_LOOSE`, `DEPTH_FIRM` in `pipeline/mannequin.py` |
 | When a figure starts out on all fours, and which way it faces | `CRAWL`, `CRAWL_SPAN`, `FACING` in `pipeline/mannequin.py` |
 | Figure proportions and part sizes | `HEIGHT`, `TORSO`, `LIMBS`, `PART_SIZES`, `TORSO_CENTRE`, `LIMB_PARTS` in `pipeline/mannequin.py` |
 | How many greys the set is painted in, how dark and light, and which parts of a surface get a grey of their own | `TONES`, `TONE_RANGE`, `TONE_CLIP`, `TONE_EDGE`, `TONE_SPECK`, `TONE_ROUND`, `TONE_CORE`, `TONE_SOLID` in `pipeline/planes.py` |
@@ -565,7 +586,7 @@ Interactive reference: <http://localhost:8000/docs>.
 | Job fails: "blender not found" / "ffmpeg not found" | Fix the path in `config.toml`; after installing ffmpeg, open a new terminal so PATH updates |
 | Fails at *Reading depth and people* with "No module named depth_anything_3" | The clone in section 3 is missing or `[paths].depth_anything_3` points elsewhere |
 | Fails at that stage the first time, other message | No internet for the one-time model downloads, or out of GPU memory (close other GPU apps) |
-| A person has no figure | Too small, too dark, seen in under 8 frames, or the detector and pose model were unsure of them (a person half hidden behind a counter, say); lower `MIN_HEIGHT`, `MIN_PERSON_SCORE`, `MIN_TRACK`, `TRACK_SCORE` or `TRACK_KEYPOINTS` in `figures.py` (lower values also let in coats, statues and posters). Someone who stands still, side on, at the very side of the picture can be taken for a pole; lower `POLE` (0 lets in the edges of buildings) |
+| A person has no figure | Too small, too dark, seen in under 8 frames, or the detector and pose model were unsure of them (a person half hidden behind a counter, say); lower `MIN_HEIGHT`, `MIN_PERSON_SCORE`, `MIN_TRACK`, `TRACK_SCORE` or `TRACK_KEYPOINTS` in `figures.py` (lower values also let in coats, statues and posters). Someone found surely for a while but not before or after is carried on only through boxes the detector was at least `FAINT_SCORE` sure of; lower it to carry them further (lower values also carry figures onto clutter). Someone who stands still, side on, at the very side of the picture can be taken for a pole; lower `POLE` (0 lets in the edges of buildings) |
 | One person becomes two figures, one after the other | They were lost for more than 48 frames or moved far while lost, or there was a cut; raise `STITCH_GAP` or `STITCH_REACH` |
 | Something carried has no coloured shape, or only part of the time | The detector missed it for long stretches (a bag in shadow, mostly behind a leg), or no wrist was seen on it in 15% of the frames it was seen in; lower `MIN_PROP_SCORE` or `CARRIED` in `figures.py` (lower values also let in false detections: planks taken for books, a taxi for a phone). Only the kinds in `PROPS` are looked for |
 | Something that is not carried has a coloured shape | A false detection that someone's hand passed over; raise `CARRIED` or `PROP_TRACK_SCORE` in `figures.py` |
@@ -584,6 +605,36 @@ The full error text of a failed job is in `jobs/<id>/job.json`.
 ---
 
 ## 8. What was verified
+
+**Faint people carried on** (2026-11-25, on the same GPU). Of the two men crawling one behind the
+other at the hall's counter (frames 490–787), the second had a figure only at frames 565–609,
+upright: everywhere else the detector was less than half sure of him, mostly hidden behind the
+first man in the dark, and dropped him. Tracks are now carried on through the boxes it is at
+least 10% sure of (see the tracking bullets in section 2). Checked on the command line, on the
+four test clips against the committed code's run of each:
+
+- **The hall.** The second crawler is followed for 238 frames (541–778) instead of 45: upright
+  until 609, his legs hidden behind the first man, and crawling from 610 to 778, as the
+  reference shows him. The first crawler is followed from 506 instead of 528, crawling where he
+  had no figure before, and to the clip's end. The other figures and the briefcase are as they
+  were. The five sets are the committed run's byte for byte, and the camera turns exactly as
+  before; the counter shot comes out 1.2% smaller in metres, as its scale is taken from its
+  median figure, which leaves the picture as it was.
+- **The other clips.** The corridor is unchanged: its 42 sets and its camera byte for byte, its
+  7 figures over the same frames, within 1.6 cm. In the studio the 15 sets and the camera's
+  turns are unchanged, and the man walking up in the dark behind the old man is followed from
+  frame 94 instead of 122; two other figures gain a frame or two. On the rooftop clip four
+  figures are carried 2 to 10 frames further and its last shot is unchanged; 53 of its 54 set
+  files are the committed run's, the 54th differing in 2 of its million pixels.
+- **First tried, and dropped.** The first version also cut the carried frames out of the set.
+  On every clip with such frames the camera's path moved, and every set built along it (see
+  *The camera path is an estimate* in section 9): the studio's first shot turned by up to 14°,
+  and the man walking in the dark was hidden behind the moved set at frames 136–168; the
+  rooftop clip's third shot changed scale by 35%; the hall's counter wall came out a grey
+  darker. A figure was also carried on at the rooftop clip's end, small and far, then
+  arms-out, by boxes the performer's body made flying past the lens. Carried frames are now
+  left in the set, and boxes the frame's sides or top cut carry no track on.
+- `pyflakes` passes on `pipeline` and `server`.
 
 **Closed frames** (2026-11-25, on the same GPU). The counter wall's window and door frames were
 drawn only in pieces, with their corners open: most of their sides lie where one surface meets
@@ -769,7 +820,10 @@ Not verified:
   surface can still show in that wall or floor next to a figure (mostly slivers left where
   outlines are straightened), and where the surfaces around a person meet behind them, a thin
   edge can show between them. When a person stays in one place or fills much of the frame, a
-  flat patch can show behind the figure.
+  flat patch can show behind the figure. Where someone fills much of the frame while the camera
+  moves, what was behind them in the set's keyframe is filled from other frames and can be put
+  at the wrong depth; seen from further along the move it shows as a slanted slab (the hall's
+  first shot, frames 303–365, behind the man walking towards the camera).
 - **Four alternatives were built and dropped:** fitting real walls and boxes from a multi-view
   reconstruction (nonsense geometry on a handheld shot), a plain box room (clean, but it threw
   away the set detail that the reference videos keep), the depth model's raw surface, lightly
@@ -780,17 +834,30 @@ Not verified:
   with little background to follow (a close-up, darkness, a whip pan) gets a rougher path, and
   over a long move its scale drifts. Each set is right for its own stretch, but where one
   stretch gives way to the next (at least 24 frames apart), the set changes in a single frame,
-  and surfaces the two sets placed differently jump a little.
+  and surfaces the two sets placed differently jump a little. Each frame is placed from the
+  features the frames before it left, so cutting a little more out of a few frames moves the
+  rest of the path, and every set built along it: in a test that cut out the frames a track was
+  carried through, the studio's first shot turned by up to 14°, and the walls at the hall's
+  counter changed grey. This is why such frames are left in.
 - **People can be missed.** The detector is unsure of people half hidden behind furniture, in
-  near darkness or mostly out of frame, and tracks it is unsure of are dropped as false
-  detections. Two people who overlap in the picture (one crawling behind another) can be boxed
-  as one, and the one behind then has no figure there. Identity is kept across gaps of up to 48
-  frames, not across cuts.
+  near darkness or mostly out of frame. A track starts only where it is surer, and is then
+  carried on through its fainter boxes; someone it is never sure of for 8 frames gets no figure
+  (the clerk behind the hall's counter). Two people who overlap in the picture can still be
+  boxed as one, and the one behind then has no figure where that happens. Identity is kept
+  across gaps of up to 48 frames, not across cuts.
+- **A loosely boxed person can be drawn twice.** Where the detector boxes someone together with
+  the dark around them while another track follows them closely, both get a figure: at the
+  corridor's desk, for 19 frames (198–216). Carrying tracks on never adds such frames (a box
+  holding half of someone else's carries no track on).
 - **Crawls and hidden people are partly guesses.** A crawl is found from the box's shape
   (short, and at first wider than tall) and the side the face is on, so someone going down onto
   all fours is shown kneeling until their box says otherwise, and someone crawling straight at
   the camera can stay kneeling. For someone mostly hidden behind another person, the depth
-  model's depth can be the two blurred together, so their figure can stand too near.
+  model blurs the two together: where the detector missed them there, their depth is taken from
+  the frames around; where it found them, the blurred depth can still place them too near.
+  While their legs are hidden their box gives no crawl: the second man crawling at the hall's
+  counter is shown upright (his legs hanging behind the first man, then kneeling) at frames
+  541–609, and crawls from 610.
 - **Someone in mid-air is taken to stand on what is below them.** A leap above a water tower is
   placed as deep as the tower.
 - **Fast, blurred footage can still hold false detections.** Something upright and narrow at
@@ -808,7 +875,9 @@ Not verified:
 - One job at a time; no progress percentage inside a stage; no accounts, so anyone who can open
   the site sees and can delete every job; Blender/ffmpeg error text includes server paths.
 
-Next steps, in order of value: catching half-hidden and dark people (and telling apart two
-who overlap) without letting in coats and posters; simpler, boxier shapes for what lies on no
-plane; then, for public hosting,
+Next steps, in order of value: telling apart two people who overlap, and keeping a crawl while
+the legs are hidden; filling the set behind someone who fills the frame at the depth the frames
+that saw it give; dropping the second figure of someone boxed loosely; a camera path that a
+few frames' cut-outs cannot move; simpler, boxier shapes for what lies on no plane; then, for
+public hosting,
 accounts, old-job cleanup, a cancel button and cleaned-up error text.

@@ -19,12 +19,21 @@ POLE = 0.2            # ... or whose sure keypoints typically lie in an upright 
                       # height, in a box the frame's side cuts: something upright and narrow at the side of the
                       # picture (the blurred edge of a building, a pole) that looks like someone standing side on
 SIDE = 0.01           # a box that ends this near the frame's left or right edge (share of its width) is cut by it
+                      # (and one this near its top, as a share of its height: see _carry_on)
 STITCH_GAP = 48       # a track that ends and another that starts at most this many frames later ...
 STITCH_REACH = 1.0    # ... within this many body heights of where it ended are one person
 SAME_TRACK = 0.5      # two tracks at the same time whose boxes typically overlap this much ...
 SAME_POSE = 0.15      # ... or whose keypoints lie this close (in body heights) are one person seen twice
 SAME_PART = 0.6       # a box mostly (this share) inside another, with keypoints that close, is a second
                       # box on the same person (all of them, and again just their upper half)
+FAINT_SCORE = 0.1     # people found less surely than MIN_PERSON_SCORE, down to this, never start a track, but carry
+FAINT_IOU = 0.5       # one on (see _carry_on) where their box overlaps its last this much, with keypoints as sure
+                      # as a track's (TRACK_KEYPOINTS): someone in the dark, or half hidden, whom the detector can
+                      # barely tell from the floor
+HIDDEN = 0.8          # ... and so does a track's box lying this much (share of it) inside someone else's: hidden
+                      # behind them
+HOLDS = 0.5           # a box holding this much (share) of someone else's box never carries a track on: it is
+                      # theirs, boxed loosely with the dark around them (as is one that overlaps theirs by FAINT_IOU)
 # Things people carry, hold, throw or ride on, and small animals (the detector's names): each is drawn as a
 # simple shape of its own colour that follows it, as the items a template is made to replace; whatever else
 # the detector knows (furniture, a parked car) stays part of the set.
@@ -66,27 +75,32 @@ class PoseEstimator:
     def __call__(self, frames):
         """frames: list of HxWx3 uint8 arrays. Returns, per frame, a list of the people in it,
         {"box": [x0, y0, x1, y1], "score": detector confidence, "kp": 17x3 array of x, y, score}
-        in pixels; and per frame a list of the things in PROPS in it, {"box", "score", "label"}."""
+        in pixels; per frame a list of the things in PROPS in it, {"box", "score", "label"}; and per
+        frame a list of the people found less surely (see FAINT_SCORE), as the people are."""
         h, w = frames[0].shape[:2]
         with torch.inference_mode():
             out = self.det(**self.det_proc(images=frames, return_tensors="pt").to(self.device))
         found = self.det_proc.post_process_object_detection(
-            out, target_sizes=torch.tensor([(h, w)] * len(frames)), threshold=min(MIN_PERSON_SCORE, MIN_PROP_SCORE))
+            out, target_sizes=torch.tensor([(h, w)] * len(frames)), threshold=min(FAINT_SCORE, MIN_PROP_SCORE))
         boxes, scores, things = [], [], []
         for r in found:
             labels, b, s = r["labels"].cpu().numpy(), r["boxes"].cpu().numpy(), r["scores"].cpu().numpy()
             names = [self.det.config.id2label[int(k)] for k in labels]
-            person = (labels == 0) & (s >= MIN_PERSON_SCORE) & ((b[:, 3] - b[:, 1]) >= MIN_HEIGHT * h)
+            tall = (labels == 0) & ((b[:, 3] - b[:, 1]) >= MIN_HEIGHT * h)
+            person = tall & (s >= MIN_PERSON_SCORE)
             keep = _surest(b[person], s[person], np.flatnonzero(person))     # (one person boxed twice: the surer)
+            unsure = tall & (s >= FAINT_SCORE) & (s < MIN_PERSON_SCORE) & np.array(
+                [all(_iou(box, b[k]) < SAME_BOX for k in keep) for box in b], bool)     # (not someone found surely)
             prop = (np.array([n in PROPS for n in names], bool) & (s >= MIN_PROP_SCORE)
                     & (np.minimum(b[:, 2] - b[:, 0], b[:, 3] - b[:, 1]) >= MIN_PROP_SIZE * h)
                     & ((b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1]) <= MAX_PROP_AREA * h * w)
                     & np.array([all(_iou(box, b[k]) < PROP_PERSON for k in keep) for box in b], bool))
             things.append([{"box": b[k].tolist(), "score": float(s[k]), "label": names[k]}
                            for k in _surest(b[prop], s[prop], np.flatnonzero(prop))])
+            keep += _surest(b[unsure], s[unsure], np.flatnonzero(unsure))
             boxes.append(b[keep])
             scores.append(s[keep])
-        people = [[] for _ in frames]
+        people, faint = [[] for _ in frames], [[] for _ in frames]
         hits = [i for i, b in enumerate(boxes) if len(b)]
         if hits:
             xywh = [np.concatenate([boxes[i][:, :2], boxes[i][:, 2:] - boxes[i][:, :2]], axis=1) for i in hits]
@@ -96,8 +110,9 @@ class PoseEstimator:
             for i, poses in zip(hits, self.pose_proc.post_process_pose_estimation(out, boxes=xywh)):
                 for b, s, p in zip(boxes[i], scores[i], poses):
                     kp = np.concatenate([p["keypoints"].cpu().numpy(), p["scores"].cpu().numpy()[:, None]], axis=1)
-                    people[i].append({"box": b.tolist(), "score": float(s), "kp": kp})
-        return people, things
+                    found_as = people if s >= MIN_PERSON_SCORE else faint
+                    found_as[i].append({"box": b.tolist(), "score": float(s), "kp": kp})
+        return people, things, faint
 
 
 def _surest(boxes, scores, index):
@@ -136,6 +151,12 @@ def _iou(a, b):
     if w <= 0 or h <= 0:
         return 0.0
     return w * h / ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - w * h)
+
+
+def within(a, b):
+    """How much (share) of box a lies inside box b."""
+    w, h = min(a[2], b[2]) - max(a[0], b[0]), min(a[3], b[3]) - max(a[1], b[1])
+    return 0.0 if w <= 0 or h <= 0 else w * h / max((a[2] - a[0]) * (a[3] - a[1]), 1e-6)
 
 
 def _expected(t, i):
@@ -281,12 +302,81 @@ def _plausible(t, width):
     return not (spread and np.median(spread) < POLE and np.mean(cut) >= 0.5)
 
 
-def track(people, width):
-    """Link per-frame detections into tracks; width is the frame's, in pixels (see POLE).
+def _carry_on(tracks, people, faint, width, height):
+    """The tracks carried on before their first frame and after their last through the people
+    found less surely (faint, and those in people no track took; see FAINT_SCORE): a box that
+    overlaps the track's nearest by FAINT_IOU, with keypoints as sure as a track's
+    (TRACK_KEYPOINTS), that neither of the frame's sides nor its top cuts (SIDE; width and
+    height: the frame's, in pixels: who is in such a box, and how much of them, the detector can
+    barely tell, a door's edge or a body flying past the lens; the bottom, which cuts the legs of
+    anyone near the camera in an ordinary shot, may), and is no one else's (neither holding HOLDS
+    of another track's box there nor the same body as its pose, part of it: see _same_body),
+    carries it on to that frame. The frames between are bridged as missed (see _join), at most
+    MAX_GAP of them in a row with no such box, not counting those where the track's box lies
+    inside someone else's (HIDDEN: hidden behind them); the track ends with the last such box, or
+    where it meets someone else's track (its box holding HOLDS of theirs). In those frames the
+    pose is that box's, keypoints and all, but missed and carried: outlined and measured later,
+    though not taken out of the set (see analyse.outline_missed)."""
+    n = len(people)
+    poses = [{} for _ in range(n)]          # (frame: {track: its pose there})
+    taken = [set() for _ in range(n)]       # (the detections tracks have)
+    for k, t in enumerate(tracks):
+        for j, p in enumerate(t["poses"]):
+            poses[t["start"] + j][k] = p
+            taken[t["start"] + j].add(id(p))
+
+    def piece(i, found):
+        return {"start": i, "last": i, "box": found["box"], "velocity": None, "hits": 0,
+                "poses": [{**found, "missed": True}]}
+    for k, t in enumerate(tracks):
+        first, length = t["start"], len(t["poses"])
+        for step in (1, -1):
+            i = t["last"] + 1 if step > 0 else t["start"] - 1
+            box, misses, found = t["box"] if step > 0 else t["poses"][0]["box"], 0, []
+            while 0 <= i < n and misses <= MAX_GAP:
+                others = [q for o, q in poses[i].items() if o != k]
+                if any(within(q["box"], box) >= HOLDS for q in others):
+                    break                   # (someone else's track takes over there)
+                near = [p for p in faint[i] + people[i] if id(p) not in taken[i] and _confidence(p) >= TRACK_KEYPOINTS
+                        and SIDE * width < p["box"][0] and p["box"][2] < (1 - SIDE) * width and SIDE * height < p["box"][1]
+                        and not any(within(q["box"], p["box"]) >= HOLDS
+                                    or q.get("kp") is not None and _same_body(p, q) for q in others)]
+                best = max(near, key=lambda p: _iou(p["box"], box), default=None)
+                if best is not None and _iou(best["box"], box) >= FAINT_IOU:
+                    found.append((i, best))
+                    taken[i].add(id(best))
+                    box, misses = best["box"], 0
+                elif not any(within(box, q["box"]) >= HIDDEN for q in others):
+                    misses += 1
+                i += step
+            if not found:
+                continue
+            if step > 0:
+                for i, p in found:
+                    _join(t, piece(i, p))
+            else:
+                found.reverse()
+                ext = piece(*found[0])
+                for i, p in found[1:]:
+                    _join(ext, piece(i, p))
+                _join(ext, t)
+                t.update(ext)
+        for j, p in enumerate(t["poses"]):
+            if not first <= t["start"] + j < first + length:
+                p["carried"] = True
+            poses[t["start"] + j][k] = p
+    return tracks
+
+
+def track(people, width, faint=None, height=None):
+    """Link per-frame detections into tracks; width is the frame's, in pixels (see POLE); faint,
+    the people found less surely in each frame, carry them on (see _carry_on; height: the
+    frame's, in pixels).
 
     Returns a list of {"start": frame_index, "poses": [pose, ...]} with a pose for every frame
     from the first detection to the last. In frames where the person was missed the pose is
     {"box": interpolated box, "kp": None, "missed": True}; otherwise it is the detection itself.
+    Where a track was carried on, its poses there are also marked "carried" (see _carry_on).
     """
     tracks = _stitch([t for t in _link(_one_per_person(found) for found in people) if _plausible(t, width)])
     tracks.sort(key=lambda t: -t["hits"])
@@ -299,7 +389,10 @@ def track(people, width):
             kept.append(t)
         else:
             kept[twin] = _combine(kept[twin], t)
-    return [{"start": t["start"], "poses": t["poses"]} for t in sorted(kept, key=lambda t: t["start"])]
+    kept.sort(key=lambda t: t["start"])
+    if faint is not None:
+        kept = _carry_on(kept, people, faint, width, height)
+    return [{"start": t["start"], "poses": t["poses"]} for t in kept]
 
 
 def track_things(things, people):

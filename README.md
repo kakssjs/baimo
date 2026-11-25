@@ -62,7 +62,9 @@ with the same framing, camera moves and timing, and a comparison film:
   there: an arm or leg the picture loses for a moment (out of frame, hidden, blurred) keeps the
   pose it is seen in just before or after, rather than dropping to the side. A teal visor shows
   where the face points, and the figure casts a shadow on the set. Someone the detector loses
-  for a moment, or boxes twice, stays one figure.
+  for a moment, or boxes twice, stays one figure, and someone it is only half sure of (in the
+  dark, or half hidden behind someone else) is followed on from the frames where it is sure of
+  them, so the second of two men crawling one behind the other keeps a figure of his own.
 - **Colour what people carry, as the items to replace.** A bag, bottle, cup, phone, ball,
   board or book (any of the everyday things the detector knows) that someone holds becomes a
   box, cylinder or ball of its own colour (the first brown, then orange, blue, red, yellow,
@@ -100,11 +102,17 @@ with the same framing, camera moves and timing, and a comparison film:
   little.
 - Where a person stood, the set behind them is a reconstruction. A few small specks or a thin
   edge can show in the wall or floor next to a figure, and a flat patch can show behind
-  someone who stays in one place or fills much of the frame.
-- People the detector is unsure of (half hidden behind a counter, very dark, mostly out of
-  frame, or overlapping someone else so that it boxes them together) can get no figure.
-  Someone mostly hidden behind another person can be placed too near, and someone going down
-  onto all fours can be shown kneeling for a second or so before their figure crawls. Someone
+  someone who stays in one place or fills much of the frame. Where someone fills much of the
+  frame while the camera moves, what was behind them can be put at the wrong depth and show as
+  a slanted slab from further along the move.
+- People the detector is never sure of (half hidden behind a counter, very dark, mostly out of
+  frame, or overlapping someone else so that it boxes them together) get no figure; someone it
+  is sure of for a while is followed on from there. Someone mostly hidden behind another person
+  is shown upright while their legs are hidden (the second crawler at the hall's counter, for
+  about two seconds, before his figure crawls), and someone going down onto all fours can be
+  shown kneeling for a second or so before their figure crawls. Someone the detector boxes
+  loosely, with the dark around them, can get a second figure beside theirs for under a
+  second. Someone
   in mid-air (a leap over a water tower) is placed as deep as what is below them. In fast,
   blurred footage something that is not a person can still get a figure for a moment; the edge
   of a building or a pole at the side of the picture no longer does, but someone standing still,

@@ -51,6 +51,9 @@ GROUND_STEADY = 4       # frames: how deep the set is under someone's feet is th
                         # frames either side (one frame's can be well off: a band below a box at the frame's edge)
 FLOOR_SPAN = 25         # frames: the floor is taken as hidden where most of the frames around that can tell say a
                         # desk hides it (a desk's or counter's top just below someone behind it can pass for a floor)
+MERGED = 0.5            # someone the detector missed, whose box lies this much (share) inside someone else's over
+                        # most of the frames around (FLOOR_SPAN), is hidden behind them: their outline's depth is that
+                        # person's as much as theirs (the depth model blurs the two together)
 TOUCH = 0.02            # boxes this near each other (share of the frame) count as overlapping; and someone whose box
                         # reaches this much further down the picture than another's is in front of them (where the
                         # depth model cannot tell)
@@ -338,19 +341,19 @@ def look(src, meta, cuts, total, work, device):
     frame.
 
     Depth and masks (people, and things where someone holds them, are taken out of the set) go to a
-    Store. Also returns the people and the things (see figures.PROPS) found in each frame, the
-    background features followed through the video (camera.Tracker) and the outlining model, which
-    is needed once more."""
+    Store. Also returns the people, the things (see figures.PROPS) and the people found less surely
+    (see figures.FAINT_SCORE: not taken out of the set here) in each frame, the background features
+    followed through the video (camera.Tracker) and the outlining model, which is needed once more."""
     width, height = meta["width"], meta["height"]
     find_people = figures.PoseEstimator(device)
     outline = figures.Segmenter(device)
     estimate = dp.DepthEstimator(device)
-    store, people, things, batch = None, [], [], []
+    store, people, things, faint, batch = None, [], [], [], []
     tracker = camera.Tracker()
 
     def flush():
         nonlocal store
-        for frame, found, items in zip(batch, *find_people(batch)):
+        for frame, found, items, unsure in zip(batch, *find_people(batch)):
             i = len(people)
             depth, sky = estimate(frame)
             h, w = depth.shape
@@ -368,6 +371,7 @@ def look(src, meta, cuts, total, work, device):
             store.put(i, depth, hole, sky, dp.unlit(frame, depth.shape), dp.grey(frame, depth.shape))
             people.append(found)
             things.append(items)
+            faint.append(unsure)
         batch.clear()
 
     for frame in read_frames(src, width, height):
@@ -378,15 +382,16 @@ def look(src, meta, cuts, total, work, device):
             flush()
     if batch:
         flush()
-    return store, people, things, tracker, outline
+    return store, people, things, faint, tracker, outline
 
 
-def follow(people, shots, width):
-    """Tracks of people (see figures.track), shot by shot so none crosses a cut; "start" is
-    the frame number in the whole video."""
+def follow(people, shots, width, height, faint):
+    """Tracks of people (see figures.track; width and height: the frame's; faint: the people found
+    less surely in each frame), shot by shot so none crosses a cut; "start" is the frame number in
+    the whole video."""
     tracks = []
     for s, e in shots:
-        tracks += [{**t, "start": s + t["start"]} for t in figures.track(people[s:e], width)]
+        tracks += [{**t, "start": s + t["start"]} for t in figures.track(people[s:e], width, faint[s:e], height)]
     return tracks
 
 
@@ -435,7 +440,11 @@ def place_props(tracks, factors, meta):
 
 def outline_missed(src, meta, tracks, store, outline):
     """Where the detector missed someone it found before and after, outline them inside the box
-    in between, so they are taken out of the set there too, and measure their depth."""
+    in between, so they are taken out of the set there too, and measure their depth. Where a
+    track was only carried on through boxes the detector was less sure of (see
+    figures._carry_on), their depth is measured but they are left in the set: the camera's path
+    is found frame by frame from what each frame leaves (camera.path), so every frame taken out
+    moves it, and the sets built along it, and a box that unsure may hold no one."""
     need = {}
     for t in tracks:
         for k, pose in enumerate(t["poses"]):
@@ -456,7 +465,8 @@ def outline_missed(src, meta, tracks, store, outline):
             mask = pose.pop("mask")
             x0, y0, x1, y1 = pose["box"]
             if 0.15 <= mask.sum() / max((x1 - x0) * (y1 - y0), 1.0) <= 1.2:    # a person-sized outline
-                found.append(mask)
+                if not pose.get("carried"):
+                    found.append(mask)
                 measure(pose, mask, depth, width, height)
         if found:
             store.put(i, hole=hole | planes.hole_mask(found, depth))
@@ -563,6 +573,13 @@ def pose_people(tracks, factors, meta, device, store, shots, sets, sets_dir):
         ground[ground > back * (1 + BEYOND)] = np.nan
         ground = np.array([np.nanmedian(ground[max(0, k - GROUND_STEADY):k + GROUND_STEADY + 1])
                            if np.isfinite(g) else np.nan for k, g in enumerate(ground)])
+        # Where the detector missed them hidden behind someone else (MERGED), their outline's depth is
+        # not theirs alone: it is taken from the frames around, as where it was not measured.
+        inside = np.array([any(figures.within(p["box"], b) >= MERGED for b in others[k])
+                           for k, p in enumerate(t["poses"])], np.float64)
+        half = FLOOR_SPAN // 2
+        z[[bool(p.get("missed")) and inside[max(0, k - half):k + half + 1].mean() > 0.5
+           for k, p in enumerate(t["poses"])]] = np.nan
         both = np.isfinite(ground) & np.isfinite(z) & (z > 0)
         if both.any():
             z = np.where(np.isfinite(ground), ground, z * np.median(ground[both] / z[both]))
@@ -671,11 +688,11 @@ def main(job_dir):
         old.unlink()
     store = None
     try:
-        store, people, things, tracker, outline = look(src, meta, cuts, total, work, device)
+        store, people, things, faint, tracker, outline = look(src, meta, cuts, total, work, device)
         n = len(people)
         cuts = [c for c in cuts if c < n]
         shots = list(zip(cuts, cuts[1:] + [n]))
-        tracks = follow(people, shots, meta["width"])
+        tracks = follow(people, shots, meta["width"], meta["height"], faint)
         carried = follow_things(things, people, shots)
         missed = outline_missed(src, meta, tracks, store, outline)
         del outline
