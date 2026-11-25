@@ -71,14 +71,18 @@ TONE_SOLID = 0.85     # a part that fills at least this share of the convex outl
                       # outline: a lamp round, a pane straight-sided, not the ragged edge the footage gives them
 LINE_STEP = 0.06      # the set's straight edges (window frames, door and panel outlines, rails, floor tiles: the
 LINE_LEN = 0.03       # footage's grey changing across a straight line by at least this share of the spread, the
-LINE_WIDTH = 0.003    # same surface on both sides, the line at least this share of the picture's width long) are
-                      # drawn on it as lines this wide, a grey darker (lighter on the darkest grey), so its windows,
-                      # doors and panels keep their outlines where their greys are too close to show them
+LINE_WIDTH = 0.003    # line at least this share of the picture's width long) are drawn on it as lines this wide, a
+                      # grey darker (lighter on the darkest grey), so its windows, doors and panels keep their
+                      # outlines where their greys are too close to show them; an edge where two surfaces meet is
+                      # drawn along the nearer of them, so that it moves with it
 LINE_JOIN = (3.0, 0.03)   # pieces of one line the detector finds apart (in line to within this many degrees and a
                           # line's width, at most this share of the picture's width apart) are joined first
 LINE_CROWD = (0.04, 5.0)  # a line crossing a square this share of the picture's width wide with more than this many
                           # lines on average is hatching (the grain of a surface, a far facade's rows of windows,
                           # a radiator's fins), not an outline, and is not drawn
+LINE_MEET = (30.0, 0.03)  # lines at least this many degrees apart that would meet within this share of the picture's
+                          # width of their ends are carried on, or cut back, to where they meet: a frame closed at
+                          # its corners
 CREASE_GAP = 0.03     # planes that meet at an angle (CREASE_ANGLE or more apart) and lie within this share of
 CREASE_ANGLE = 10.0   # each other in depth along their seam are cut along the line where they meet (a room's
 CREASE_REACH = 0.02   # corner, a box's edge), where it runs within this share of the frame width of the seam
@@ -528,18 +532,19 @@ def tone_spread(greys):
     return tuple(np.percentile(seen, [TONE_CLIP, 100 - TONE_CLIP])) if len(seen) else (0.0, 255.0)
 
 
-def set_tones(g, valid, piece, spread):
+def set_tones(g, q, piece, spread):
     """A set's picture painted in TONES even greys, for a texture (uint8 albedo, linear): its grey
-    levels (g, see SetDepth.splat: nan where not seen; valid where there is a set) spread over
-    TONE_RANGE from spread's low to its high (see tone_spread); each surface (piece: a number per
-    pixel, see outline_shifts) the median grey seen on it, as a set builder paints a wall, and
-    each part of it that stands out from the rest (see TONE_EDGE; trimmed to its core, TONE_CORE)
-    the median grey seen on that part, each rounded to the nearest of the TONES, a part that is
-    nearly convex drawn as its convex outline (TONE_SOLID). So walls, floors and steps come out
-    even, with no blotches where the light fell unevenly, and windows, doors, lamps and rails keep
-    the footage's light and dark. What was not seen (behind people throughout) takes the grey of
-    the nearest of its own surface that was, so no outline of them shows. The set's straight edges
-    are drawn on it as lines (see LINE_STEP, straight_edges)."""
+    levels (g, see SetDepth.splat: nan where not seen; there is a set where its inverse depth q is
+    above 0) spread over TONE_RANGE from spread's low to its high (see tone_spread); each surface
+    (piece: a number per pixel, see outline_shifts) the median grey seen on it, as a set builder
+    paints a wall, and each part of it that stands out from the rest (see TONE_EDGE; trimmed to
+    its core, TONE_CORE) the median grey seen on that part, each rounded to the nearest of the
+    TONES, a part that is nearly convex drawn as its convex outline (TONE_SOLID). So walls, floors
+    and steps come out even, with no blotches where the light fell unevenly, and windows, doors,
+    lamps and rails keep the footage's light and dark. What was not seen (behind people
+    throughout) takes the grey of the nearest of its own surface that was, so no outline of them
+    shows. The set's straight edges are drawn on it as lines (see LINE_STEP, straight_edges)."""
+    valid = q > 0
     ok = valid & np.isfinite(g)
     observed = ok.copy()
     if not ok.any():
@@ -611,25 +616,29 @@ def set_tones(g, valid, piece, spread):
         _, (iy, ix) = ndimage.distance_transform_edt(~ok, return_indices=True)     # edges blend with
         out = out[iy, ix]                                                           # nothing else)
     step = (TONE_RANGE[1] - TONE_RANGE[0]) / (TONES - 1)
-    out = np.where(straight_edges(t, observed, piece),
+    out = np.where(straight_edges(t, observed, piece, q),
                    np.where(out > TONE_RANGE[0] + step / 2, out - step, out + step), out)
     return np.round(out * 255).astype(np.uint8)
 
 
-def straight_edges(t, seen, piece):
+def straight_edges(t, seen, piece, q):
     """Where the set's straight edges run, to draw (see LINE_STEP): the lines a line segment
     detector finds in its grey (t, 0..1; seen: where it was seen, the rest as the nearest seen, so
-    no edge runs along people), kept where the grey differs across them by LINE_STEP and both
-    sides were seen on one surface (piece; where two surfaces meet, the set shows it), joined
-    (LINE_JOIN) and at least LINE_LEN long; a mask of lines LINE_WIDTH wide, where seen."""
+    no edge runs along people), kept where the grey differs across them by LINE_STEP, joined
+    (LINE_JOIN), at least LINE_LEN long and closed where they meet at an angle (LINE_MEET); a mask
+    of lines LINE_WIDTH wide, where seen. A line within one surface (piece) is drawn on it; one
+    where two surfaces meet is drawn along the edge of the nearer (q: inverse depth), as its
+    outline, so that it moves with it as the camera moves rather than lying half on what is
+    behind it."""
     h, w = t.shape
-    mask = np.zeros((h, w), np.uint8)
+    mask = np.zeros((h, w), bool)
     if not seen.any():
-        return mask.astype(bool)
+        return mask
     _, (iy, ix) = ndimage.distance_transform_edt(~seen, return_indices=True)
     found = cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD).detect(np.round(t[iy, ix] * 255).astype(np.uint8))[0]
     off = max(2.0, 1.25 * LINE_WIDTH * w)       # (pixels either side at which each side's grey is read)
-    keep = []
+    width = max(1, round(LINE_WIDTH * w))
+    keep, own = [], []                          # (the pieces kept, and the surface each is drawn on)
     for seg in (np.zeros((0, 4)) if found is None else found.reshape(-1, 4)):
         d = np.hypot(seg[2] - seg[0], seg[3] - seg[1])
         if d < LINE_LEN * w / 4:                # (a speck, not a piece of a line)
@@ -640,30 +649,90 @@ def straight_edges(t, seen, piece):
         (ax, ay), (bx, by) = [(np.clip(np.round(x + k * off * nx).astype(int), 0, w - 1),
                                np.clip(np.round(y + k * off * ny).astype(int), 0, h - 1)) for k in (1, -1)]
         both = seen[ay, ax] & seen[by, bx]
-        if (both.mean() >= 0.8 and np.mean(piece[ay, ax][both] == piece[by, bx][both]) >= 0.7
-                and abs(np.median(t[ay, ax][both]) - np.median(t[by, bx][both])) >= LINE_STEP):
+        if both.mean() < 0.8 or abs(np.median(t[ay, ax][both]) - np.median(t[by, bx][both])) < LINE_STEP:
+            continue
+        a, b = piece[ay, ax][both], piece[by, bx][both]
+        if np.mean(a == b) >= 0.7:
             keep.append(seg)
-    lines = [np.round(s).astype(int) for s in _join(np.array(keep, np.float64).reshape(-1, 4), w)
-             if np.hypot(s[2] - s[0], s[3] - s[1]) >= LINE_LEN * w]
+            own.append(np.bincount(a).argmax())
+        else:           # (between two surfaces: onto the nearer, by half a line and a pixel)
+            side = 1 if np.median(q[ay, ax][both]) >= np.median(q[by, bx][both]) else -1
+            keep.append(seg + np.tile(side * (width / 2 + 1) * np.array([nx, ny]), 2))
+            own.append(np.bincount(a if side > 0 else b).argmax())
+    keep, own = np.array(keep, np.float64).reshape(-1, 4), np.array(own, np.int64)
     thin = np.zeros((h, w), np.float32)
-    for x0, y0, x1, y1 in np.round(keep).astype(int).reshape(-1, 4):     # (every piece: grain is many short ones)
+    for x0, y0, x1, y1 in np.round(keep).astype(int):     # (every piece: grain is many short ones)
         cv2.line(thin, (x0, y0), (x1, y1), 1.0, 1)
     size = max(3, round(LINE_CROWD[0] * w))
     crowd = cv2.boxFilter(thin, -1, (size, size)) * size        # (about how many lines cross the square)
-    for x0, y0, x1, y1 in lines:
+    joined, group = _join(keep, w)
+    lines, on = [], []
+    for k, (x0, y0, x1, y1) in enumerate(joined):
         s = np.linspace(0, 1, 20)           # (a joined line can end a little beyond the picture)
         along = (np.clip(np.round(y0 + s * (y1 - y0)).astype(int), 0, h - 1),
                  np.clip(np.round(x0 + s * (x1 - x0)).astype(int), 0, w - 1))
-        if np.mean(crowd[along]) <= LINE_CROWD[1]:
-            cv2.line(mask, (x0, y0), (x1, y1), 1, max(1, round(LINE_WIDTH * w)))
-    return mask.astype(bool) & seen
+        if np.hypot(x1 - x0, y1 - y0) >= LINE_LEN * w and np.mean(crowd[along]) <= LINE_CROWD[1]:
+            lines.append((x0, y0, x1, y1))
+            on.append(np.unique(own[group == k]))       # (the surfaces its pieces are drawn on)
+    pad = width + 1
+    for (x0, y0, x1, y1), surfaces in zip(np.round(_meet(np.array(lines, np.float64).reshape(-1, 4), w)).astype(int),
+                                          on):
+        box = (slice(max(0, min(y0, y1) - pad), min(h, max(y0, y1) + pad + 1)),
+               slice(max(0, min(x0, x1) - pad), min(w, max(x0, x1) + pad + 1)))
+        if box[0].start >= box[0].stop or box[1].start >= box[1].stop:
+            continue
+        line = np.zeros((box[0].stop - box[0].start, box[1].stop - box[1].start), np.uint8)
+        cv2.line(line, (x0 - box[1].start, y0 - box[0].start), (x1 - box[1].start, y1 - box[0].start), 1, width)
+        mask[box] |= (line > 0) & np.isin(piece[box], surfaces)        # (on those surfaces only)
+    return mask & seen
+
+
+def _meet(lines, w):
+    """Lines (n x 4: x0, y0, x1, y1) that would meet at an angle (see LINE_MEET) carried on, or cut
+    back where one passes the other by at most two line widths, to where they meet: a frame closed
+    at its corners. The meetings that move the ends least are made first, and each end makes one."""
+    n = len(lines)
+    if n < 2:
+        return lines
+    p = lines[:, :2]
+    length = np.linalg.norm(lines[:, 2:] - p, axis=1)
+    u = (lines[:, 2:] - p) / length[:, None]
+    trim = 2 * max(1, round(LINE_WIDTH * w))
+    i, j = np.triu_indices(n, 1)
+    angled = np.abs(np.sum(u[i] * u[j], axis=1)) <= np.cos(np.radians(LINE_MEET[0]))
+    i, j = i[angled], j[angled]
+    cross = u[i, 0] * u[j, 1] - u[i, 1] * u[j, 0]
+    rel = p[j] - p[i]
+    s = (rel[:, 0] * u[j, 1] - rel[:, 1] * u[j, 0]) / cross       # (where they meet, along i ...
+    r = (rel[:, 0] * u[i, 1] - rel[:, 1] * u[i, 0]) / cross       # ... and along j)
+
+    def end(t, size):
+        """Which end of a line moves to a meeting t along it (0, 1; -1: neither, it lies within)
+        and how far it is carried on (below 0: cut back)."""
+        near = np.minimum(trim, size / 2)
+        e = np.where(t < near, 0, np.where(t > size - near, 1, -1))
+        return e, np.where(e == 0, -t, np.where(e == 1, t - size, 0.0))
+    ei, mi = end(s, length[i])
+    ej, mj = end(r, length[j])
+    meets = ((ei >= 0) | (ej >= 0)) & (mi <= LINE_MEET[1] * w) & (mj <= LINE_MEET[1] * w)
+    done = np.zeros((n, 2), bool)
+    out = lines.copy()
+    for c in np.flatnonzero(meets)[np.argsort((np.abs(mi) + np.abs(mj))[meets], kind="stable")]:
+        ends = [(a, e) for a, e in ((i[c], ei[c]), (j[c], ej[c])) if e >= 0]
+        if any(done[a, e] for a, e in ends):
+            continue
+        for a, e in ends:
+            out[a, 2 * e:2 * e + 2] = p[i[c]] + s[c] * u[i[c]]
+            done[a, e] = True
+    return out
 
 
 def _join(segs, w):
     """Pieces of one straight line (segs: x0, y0, x1, y1 each) joined into one segment over all of
-    them (see LINE_JOIN): those in line with each other, near enough end to end, linked in turn."""
+    them (see LINE_JOIN): those in line with each other, near enough end to end, linked in turn.
+    Returns the segments, and which of them each piece went into."""
     if len(segs) < 2:
-        return segs
+        return list(segs), np.arange(len(segs))
     p, q = segs[:, :2], segs[:, 2:]
     length = np.linalg.norm(q - p, axis=1)
     u = (q - p) / length[:, None]
@@ -688,7 +757,7 @@ def _join(segs, w):
         i = members[np.argmax(length[members])]         # (along the longest of them)
         along = np.concatenate([(p[members] - p[i]) @ u[i], (q[members] - p[i]) @ u[i]])
         out.append(np.concatenate([p[i] + along.min() * u[i], p[i] + along.max() * u[i]]))
-    return out
+    return out, group
 
 
 def motion_view(frame, hole, sky):

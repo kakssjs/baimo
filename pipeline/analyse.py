@@ -500,13 +500,13 @@ def build_sets(store, shots, tracker, sets_dir, device):
             at, across, down, moved, piece = planes.outline_shifts(depth)
             np.savez_compressed(sets_dir / f"{number:03d}_edges.npz", at=at, across=across, down=down, q=moved,
                                 piece=piece)
-            greys.append((number, grey, depth > 0, piece))
+            greys.append((number, grey, depth, piece))
             sets.append({"file": f"{number:03d}.npy", "first": s + a, "last": s + b - 1, "centre": centre,
                          "key": poses[key][:2]})
             number += 1
         spread = planes.tone_spread([g for _, g, _, _ in greys])      # (one for the shot's sets)
-        for k, grey, valid, piece in greys:
-            cv2.imwrite(str(sets_dir / f"{k:03d}_tone.png"), planes.set_tones(grey, valid, piece, spread))
+        for k, grey, q, piece in greys:
+            cv2.imwrite(str(sets_dir / f"{k:03d}_tone.png"), planes.set_tones(grey, q, piece, spread))
         info.append({"poses": [p[:2] for p in poses], "typical": float(np.median(dists)), "sets": sets})
     return info, factors
 

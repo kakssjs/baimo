@@ -249,14 +249,21 @@ correlates with the one before it; nothing is carried across a cut.
   detector reads the set's greys (spots behind people throughout taken as the nearest seen
   spot, so no edge runs along a person's outline); a piece is kept where the grey a little more
   than a line's width (at least 2 pixels) either side of it differs by at least 6% of the spread
-  and both sides were seen on one surface (where two surfaces meet, the set shows it already);
-  pieces in line to within 3° and a line's width, at most 3% of the picture's width apart, are
-  joined into one line, and lines at least 3% of the picture's width long are drawn 0.3% of it
-  wide, one grey darker than the surface (one lighter on the darkest grey). A line is left out
-  where, in a square 4% of the picture's width across, more than 5 pieces cross on average along
-  it: that is the grain of a surface, a far facade's rows of windows or a radiator's fins
-  (hatching), not an outline. So windows, doors, panels, rails and floor tiles keep crisp,
-  straight outlines, and no blotches or scratches come with them.
+  and both sides were seen. A piece within one surface is drawn on it. A piece where two
+  surfaces meet (a door set in its frame, a pillar against the wall behind it) is moved half a
+  line and a pixel onto the nearer of them and drawn on that one only, as its outline, so it
+  moves with it as the camera moves and never lies half on what is behind it. Pieces in line to
+  within 3° and a line's width, at most 3% of the picture's width apart, are joined into one
+  line, and lines at least 3% of the picture's width long are drawn 0.3% of it wide, one grey
+  darker than the surface (one lighter on the darkest grey). A line is left out where, in a
+  square 4% of the picture's width across, more than 5 pieces cross on average along it: that
+  is the grain of a surface, a far facade's rows of windows or a radiator's fins (hatching), not
+  an outline. Lines at least 30° apart that would meet within 3% of the picture's width of their
+  ends are carried on to where they meet, and one that passes the other by at most two line
+  widths is cut back to it (the meetings that move the ends least first, each end once), so a
+  window's or door's frame closes at its corners and a crossbar meets its sides. So windows,
+  doors, panels, rails and floor tiles keep crisp, straight, closed outlines, and no blotches or
+  scratches come with them.
 - **Hand-over.** Each set is shown for its own stretch and stands perfectly still while the
   camera moves through it; where one stretch ends, the next set takes over in a single frame.
   Each set is also built from the 6 frames on either side of its stretch, so neighbours match
@@ -523,7 +530,7 @@ in `WB/Props` (`Prop_01_suitcase`, …), each with its own material, to swap for
 | When a figure starts out on all fours, and which way it faces | `CRAWL`, `CRAWL_SPAN`, `FACING` in `pipeline/mannequin.py` |
 | Figure proportions and part sizes | `HEIGHT`, `TORSO`, `LIMBS`, `PART_SIZES`, `TORSO_CENTRE`, `LIMB_PARTS` in `pipeline/mannequin.py` |
 | How many greys the set is painted in, how dark and light, and which parts of a surface get a grey of their own | `TONES`, `TONE_RANGE`, `TONE_CLIP`, `TONE_EDGE`, `TONE_SPECK`, `TONE_ROUND`, `TONE_CORE`, `TONE_SOLID` in `pipeline/planes.py` |
-| Which straight edges are drawn on the set as lines, and how wide | `LINE_STEP`, `LINE_LEN`, `LINE_WIDTH`, `LINE_JOIN`, `LINE_CROWD` in `pipeline/planes.py` |
+| Which straight edges are drawn on the set as lines, how wide, and where they are closed into corners | `LINE_STEP`, `LINE_LEN`, `LINE_WIDTH`, `LINE_JOIN`, `LINE_CROWD`, `LINE_MEET` in `pipeline/planes.py` |
 | Which things count as carried (what, how sure, how big, held by whom), and when two tracks are one thing | `PROPS`, `MIN_PROP_SCORE`, `MIN_PROP_SIZE`, `MAX_PROP_AREA`, `PROP_PERSON`, `PROP_TRACK_SCORE`, `SAME_THING`, `KINDS`, `SAME_KIND`, `CARRIED`, `HOLD`, `CARRIER` in `pipeline/figures.py`; how steady their path is, and which depth readings are taken as misses: `PROP_STEADY`, `PROP_JUMP` in `pipeline/analyse.py` |
 | Figure, visor, prop and set colours; how bright the render is; prop shapes; bevel; which set squares become one face | `FIGURE_COLOUR`, `VISOR_COLOUR`, `PROP_COLOURS`, `EXPOSURE`, `ROUND`, `UPRIGHT`, `PROP_DEPTH`, `SET_COLOUR`, `BEVEL`, `BLOCK`, `FLAT`, `EDGE_ON`, `BACK`, `LEDGE`, `LEDGE_GAP` in `pipeline/blender/build_scene.py` |
 | Light and render samples | the light and render sections at the end of `build_scene.py` |
@@ -577,6 +584,35 @@ The full error text of a failed job is in `jobs/<id>/job.json`.
 ---
 
 ## 8. What was verified
+
+**Closed frames** (2026-11-25, on the same GPU). The counter wall's window and door frames were
+drawn only in pieces, with their corners open: most of their sides lie where one surface meets
+another (an opening's plane against the wall around it), and lines there were left out. Such a
+line is now drawn along the edge of the nearer surface, and lines that meet at an angle are
+carried on, or cut back, to where they meet (see Lines above).
+
+- **The counter shot.** In its set the right-hand opening is a closed frame with its transom,
+  the other two openings' sides run their full height, and the corners of all three close. The
+  coat-check sign in the first shot (frame 281) is a closed rectangle, where its corners were
+  open before. Laid beside the film and the reference at eight frames covering every shot, and
+  compared close up at the stairs, the stair window and the hall's doors, nothing was lost; one
+  step's edge on the stairs gains a line.
+- **All the sets.** The 42 sets of the four test clips and the hall's 5 were painted again with
+  this code, at most 6.1 s a set; 0–2.8% of each texture changed. Closing a corner moved a
+  line's end by a median 0.5–0.9% of the picture's width per set, never more than 3%.
+- **No flicker added.** On the hall (a job made from the website's own encode), the change
+  between ordinary frames stays 0.83 grey levels (median), and where one set hands over to the
+  next (frames 229→230 and 302→303) 15.5 and 20.1 (before 15.7 and 20.1).
+- **Through the website.** After a restart, the same video went through the website again, to
+  `final.mp4` (1280×1832, 787 frames, 30 fps, with sound) and `white.mp4` in 757 s: 594 s to
+  the Blender scene, 163 s rendering and combining. Its `scene.json` (camera, sets, figures,
+  props) is the same as the previous run's, its five set paintings are the command-line test's
+  pixel for pixel, and at the eight frames its picture is within 0.6 grey levels (mean) of it.
+- **Still missing.** A frame stops where a person stood in front of it all through the shot,
+  as nothing there was seen (the man in front of the middle opening). The doors' panels in the
+  first shot's dark hall and the knots where the stair window's bars cross are as before. Not
+  part of the set, but seen in the same frames: of the two men crawling one behind the other at
+  the counter, only one gets a figure (also before).
 
 **The set's outlines** (2026-11-25, on the same RTX 5060 laptop GPU). In the hall's counter
 shot (frames 490–787) the back wall's three window openings, the door frames, the coat-check

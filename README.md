@@ -35,11 +35,12 @@ with the same framing, camera moves and timing, and a comparison film:
   blotches where the light fell unevenly; a part that is nearly convex (a pane, or a lamp without
   the glow around it) is drawn as a clean round or straight-sided shape. The set's straight
   edges (window frames, door and panel outlines, rails, floor tiles) are drawn on it as crisp
-  lines one grey darker, so they keep their outlines even where the footage is too dim for the
-  greys to tell them apart. The greys are the same in every set of a shot, so a wall keeps its
-  grey as the camera moves on. Every surface is shaded flat, like the boards of a
-  hand-built set: Blender renders the figures' soft shadows on it, but the set casts none on
-  itself.
+  lines one grey darker, closed at the corners where they meet, so they keep their outlines even
+  where the footage is too dim for the greys to tell them apart; where one surface stands in
+  front of another (a door in its frame, a pillar before a wall) the line is drawn on the nearer,
+  so it moves with it. The greys are the same in every set of a shot, so a wall keeps its grey
+  as the camera moves on. Every surface is shaded flat, like the boards of a hand-built set:
+  Blender renders the figures' soft shadows on it, but the set casts none on itself.
 - **Build the set through the dark.** Where the footage is too dark to see, the walls, floors and
   ceilings around it carry on through it, as on a real set. Only where it opens into darkness
   that nothing around can close (a doorway into an unlit room) is it left as a plain dark void.
