@@ -35,12 +35,18 @@ with the same framing, camera moves and timing, and a comparison film:
   blotches where the light fell unevenly; a part that is nearly convex (a pane, or a lamp without
   the glow around it) is drawn as a clean round or straight-sided shape. The set's straight
   edges (window frames, door and panel outlines, rails, floor tiles) are drawn on it as crisp
-  lines one grey darker, closed at the corners where they meet, so they keep their outlines even
+  lines one grey darker, closed at the corners where they meet (a rail's two edges and its
+  shadow on the wall as one line), so they keep their outlines even
   where the footage is too dim for the greys to tell them apart; where one surface stands in
   front of another (a door in its frame, a pillar before a wall) the line is drawn on the nearer,
   so it moves with it. The greys are the same in every set of a shot, so a wall keeps its grey
-  as the camera moves on. Every surface is shaded flat, like the boards of a hand-built set:
-  Blender renders the figures' soft shadows on it, but the set casts none on itself.
+  as the camera moves on. Every surface is shaded flat, like the boards of a hand-built set, and
+  the set is modelled where a set builder would model it: its straight edges stand out from it
+  as mouldings, and each lamp that stands out from its wall or ceiling (lighter or darker by at
+  least half the greys; on a floor or desk only a coloured one) as a ball, so window frames, rails, door and panel
+  outlines, radiator fins and lamps
+  catch the light and cast soft shadows. Blender renders the figures' soft shadows on the set
+  too, but its flat surfaces cast none on each other.
 - **Build the set through the dark.** Where the footage is too dark to see, the walls, floors and
   ceilings around it carry on through it, as on a real set. Only where it opens into darkness
   that nothing around can close (a doorway into an unlit room) is it left as a plain dark void.
@@ -71,7 +77,9 @@ with the same framing, camera moves and timing, and a comparison film:
   green, purple, pink), as big as it is seen, following its path frame by frame: where it is
   carried, how long it hangs still, how near it comes. Found again after it went out of the
   picture, or after a cut, it is the same item in the same colour. It is cut out of the set
-  where it is held. Things nobody holds stay part of the set.
+  where it is held. Things nobody holds stay part of the set; those of a vivid colour of their
+  own, unlike the rest of the set (the yellow desk lamps in a teal hall), are painted in that
+  colour, vivid, as items to replace too.
 - **Keep the two halves in step.** The white model lines up with the footage pixel for pixel
   and has the same frame rate and frame count.
 - **Render at a watchable size.** Small uploads are enlarged so each half is at least 1280
@@ -95,8 +103,13 @@ with the same framing, camera moves and timing, and a comparison film:
   seen from above, or winding, they keep the planes found. Only the straight edges the footage
   shows clearly are drawn as lines: detail too dim to tell apart (a door's panels in a dark hall)
   is left out, and a lamp on a piece of set turned away from the light is shaded darker than it
-  is. What is built through the dark is the surfaces around it carried on, not what is really
-  there, and a dark void is a flat backdrop with no depth.
+  is. Every such line stands out as a moulding, so the edge of a patch of light or a stair's
+  nosing gets one too; a lamp is a ball sitting on the wall behind it (the depth model puts a
+  hanging lamp on its wall), and a lamp that stands out only a little from its wall stays flat.
+  A small thing just in front of the camera (the big desk lamp at the hall's counter) is in the
+  set in its outline and colour, but painted on the surface behind it, not standing out from it.
+  What is built through the dark is the surfaces around it carried on, not what is really there,
+  and a dark void is a flat backdrop with no depth.
 - Where a long camera move passes from one set to the next (at least 24 frames apart), the set
   changes in a single frame: each set is cut into panels on its own, so some panels jump a
   little.
@@ -120,9 +133,10 @@ with the same framing, camera moves and timing, and a comparison film:
   who comes back after a cut, or after more than 48 frames out of sight, becomes a new figure.
 - Only what someone holds becomes a coloured prop, and only while the detector sees it (it is
   unsure of a bag in dark footage, and can lose it for seconds, when it is not shown). A thing
-  that nobody holds stays grey in the set, and the colours go by the order in which the items
-  first appear, not by kind. Two things of one kind, one lost from view as the other appears,
-  can be taken for one item.
+  that nobody holds stays part of the set, grey unless its own colour is vivid and unlike the
+  rest of the set (a pale or dark item, or one in the set's own colour, stays grey), and the
+  colours of carried things go by the order in which the items first appear, not by kind. Two
+  things of one kind, one lost from view as the other appears, can be taken for one item.
 - One video is processed at a time. Limits: 200 MB, 60 seconds, 1920×1080 (portrait allowed).
 - It is built for one machine and one user: no accounts, so anyone who can open the site sees
   every video.

@@ -23,6 +23,15 @@ def grey(frame, shape):
     return cv2.cvtColor(cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA), cv2.COLOR_RGB2GRAY)
 
 
+def chroma(frame, shape):
+    """Frame's colour (HxWx3 uint8, RGB) apart from its light and dark: its Lab a and b (uint8, 128
+    for grey), at half the depth model's working size shape (h, w), as colour shows in larger
+    patches than light and dark do."""
+    h, w = shape
+    small = cv2.resize(frame, ((w + 1) // 2, (h + 1) // 2), interpolation=cv2.INTER_AREA)
+    return np.ascontiguousarray(cv2.cvtColor(small, cv2.COLOR_RGB2LAB)[..., 1:])
+
+
 def unlit(frame, shape):
     """Where frame (HxWx3 uint8, RGB) is too dark to see anything, at the depth model's working
     size shape ((h, w) bool): large patches nearly black and nearly even (see UNLIT)."""

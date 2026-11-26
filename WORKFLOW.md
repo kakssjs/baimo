@@ -24,8 +24,8 @@ Every video becomes one **job** with its own folder `jobs/<id>/`. The page polls
 |---|---|---|---|
 | `queued` (Waiting) | Upload saved, waiting for the worker | `server/app.py` | `input.<ext>`, `job.json` |
 | `ingest` (Preparing video) | Check limits; convert to constant frame rate, even size, H.264 + AAC | `media.ingest` | `source.mp4` |
-| `analyse` (Reading depth and people) | See section 2 | `pipeline/analyse.py`, `depth.py`, `camera.py`, `planes.py`, `figures.py`, `mannequin.py` | `sets/NNN.npy`, `sets/NNN_edges.npz`, `sets/NNN_tone.png`, `scene.json` |
-| `build` (Building 3D scene) | Blender builds the sets in the footage's greys, the figures, a coloured shape for each thing someone carries, the moving camera and the light | `pipeline/blender/build_scene.py` | `scene.blend` |
+| `analyse` (Reading depth and people) | See section 2 | `pipeline/analyse.py`, `depth.py`, `camera.py`, `planes.py`, `figures.py`, `mannequin.py` | `sets/NNN.npy`, `sets/NNN_edges.npz`, `sets/NNN_tone.png`, `sets/NNN_relief.npz`, `scene.json` |
+| `build` (Building 3D scene) | Blender builds the sets in the footage's greys, with their mouldings and lamps, the figures, a coloured shape for each thing someone carries, the moving camera and the light | `pipeline/blender/build_scene.py` | `scene.blend` |
 | `render` (Rendering in Blender) | Blender renders every frame (the .blend, which holds the whole scene, is zipped later, on its first download) | `pipeline/blender/render_shot.py` | `white.mp4` (`scene.zip`) |
 | `compose` (Combining) | Original (scaled to the render size) stacked over the white model, original audio kept | `media.compose` | `final.mp4` |
 | `done` / `failed` | Result shown, or the error message | `pipeline/job.py` | — |
@@ -145,7 +145,9 @@ correlates with the one before it; nothing is carried across a cut.
   drop out. A spot counts as seen when it is uncovered in at least 30% of the frames that looked
   at it, and as too dark when it was too dark in most of the frames that saw it. What is very
   near the keyframe's camera (less than 15% of the distance to what it looks at) is left out, as
-  it is seen too steeply from there to place well.
+  it is seen too steeply from there to place well (the side walls beside a camera that pulls
+  back), unless the keyframe itself sees something that near where it falls (at least 80% as far
+  as that: a lamp just in front of the camera, as at the hall's counter, `NEAR_SEEN`).
 - **Planes.** The work is done in inverse depth (1 / depth), where every flat surface is a linear
   function of pixel position. Walls, floors, steps and furniture faces are found as planes: a
   pixel joins a plane when it is within 2% of it in depth and faces the same way (planes are
@@ -241,9 +243,10 @@ correlates with the one before it; nothing is carried across a cut.
   back behind people are less than half of their patch, they are specks of someone's outline
   that the depth model blurred back, and the patch stays on its plane.
 - **Greys.** The set is painted as a set builder paints one, in 6 even greys, light and dark
-  where the footage is (`planes.set_tones`). The frames' grey levels are laid onto the set's
-  picture with their depths and the median is taken at each spot, so people passing through
-  drop out; a spot behind people throughout takes the median grey of the rest of its surface.
+  where the footage is (`planes.set_tones`). The frames' grey levels, and their colour (Lab a
+  and b, kept at half the depth maps' size), are laid onto the set's picture with their depths
+  and the median of each is taken at each spot, so people passing through drop out; a spot
+  behind people throughout takes the median grey of the rest of its surface.
   The levels are spread from the 2nd to the 98th percentile over all the sets of the shot
   together, so a wall keeps its grey when one set hands over to the next. Each surface (as
   Build follows them round) gets the median grey seen on it, so walls, floors and steps are one
@@ -276,12 +279,30 @@ correlates with the one before it; nothing is carried across a cut.
   darker than the surface (one lighter on the darkest grey). A line is left out where, in a
   square 4% of the picture's width across, more than 5 pieces cross on average along it: that
   is the grain of a surface, a far facade's rows of windows or a radiator's fins (hatching), not
-  an outline. Lines at least 30° apart that would meet within 3% of the picture's width of their
+  an outline. A line within 15° of a longer one, its middle beside it within 2% of the picture's
+  width, is another edge of the same thing (a rail's two edges, its shadow on the wall) and is
+  left out, so a rail is one line, and one moulding, not a bundle of them (`LINE_BUNDLE`).
+  Lines at least 30° apart that would meet within 3% of the picture's width of their
   ends are carried on to where they meet, and one that passes the other by at most two line
   widths is cut back to it (the meetings that move the ends least first, each end once), so a
   window's or door's frame closes at its corners and a crossbar meets its sides. So windows,
   doors, panels, rails and floor tiles keep crisp, straight, closed outlines, and no blotches or
   scratches come with them.
+- **Relief.** A painted line alone leaves the set looking like a flat painting, where a
+  modelled set's frames, rails and lamps catch the light. So each stretch of a line that runs
+  over one surface also stands out from it as a moulding, two line widths wide and proud, on
+  the plane fitted to that surface round it; and a part drawn as its convex outline that fills
+  at least 75% of the circle round it, and stands at least 3 of the 6 greys apart from the ring
+  round it (a lamp against its wall, not a lit patch of the wall), as a ball of that radius on
+  its surface. Both are written beside the set (`sets/NNN_relief.npz`), and Build models them.
+- **Colour.** The set is grey, but a thing in it of a vivid colour of its own is an item a
+  template should show as one to replace, as it shows what people carry. Where the median
+  colour is at least 45 vivid (Lab chroma) and at least 30 from the set's own colour (its
+  median: the film's grade, so a teal hall's walls stay grey), over at least 0.02% and at most
+  3% of the picture (an item, not a wall), rounded off like a part and drawn as its convex
+  outline where it nearly fills it, the item is painted in its own hue, 60 vivid, as light as
+  its grey (the hall's yellow desk lamps). A pale or dark item, or one in the set's own colour,
+  stays grey.
 - **Hand-over.** Each set is shown for its own stretch and stands perfectly still while the
   camera moves through it; where one stretch ends, the next set takes over in a single frame.
   Each set is also built from the 6 frames on either side of its stretch, so neighbours match
@@ -292,7 +313,8 @@ correlates with the one before it; nothing is carried across a cut.
   picture, 0 where there is nothing (sky, or never seen), and -1 where it is left empty for the
   dark. Beside it, `sets/NNN_edges.npz` holds where the pixels along its outlines go in the
   mesh, on the straight lines the outlines were drawn as, and which surface each pixel is on
-  (see Build), and `sets/NNN_tone.png` its greys, on the same picture.
+  (see Build), `sets/NNN_tone.png` its greys and its items' colours, on the same picture, and
+  `sets/NNN_relief.npz` its mouldings and balls (see Relief).
 
 *3. Figures* (`pipeline/mannequin.py`).
 
@@ -418,7 +440,15 @@ frame's camera (looking along +Y), scaled to metres:
     boards of a set built by hand, not like moulded clay.
   - It is painted with its greys (`sets/NNN_tone.png`, mapped onto it pixel for pixel and kept
     inside the `.blend`), so each wall, floor and step is one even grey, darker or lighter as in
-    the footage, with its windows, doors and lamps picked out.
+    the footage, with its windows, doors and lamps picked out and its items in their colours.
+  - Its relief (`sets/NNN_relief.npz`) is a second mesh in the set's space, shown with it and
+    painted with the same picture: each moulding a box along its line on its surface's plane,
+    as wide and as proud as two line widths where it lies (a third as proud on a floor or
+    ceiling, so no one trips on it), and each lamp a smooth ball sitting on its surface, on a
+    wall or under a ceiling: a round part on a surface facing up more than 0.7 (a floor) is a
+    patch of light, not a lamp, and gets none (`BALL_FLOOR`), unless it is an item of a colour
+    of its own (a desk lamp on a counter). Unlike the set, the relief casts
+    shadows, so mouldings and lamps stand out as modelled.
   - What was left empty for the dark is a dark navy backdrop, unlit and casting no shadow, as in
     the reference films: one flat surface twice as far back as the farthest of the set, reaching
     3% of the set's width in behind its edges, so no light gap opens beside it as the camera
@@ -441,8 +471,9 @@ frame's camera (looking along +Y), scaled to metres:
 - **Camera**: placed and turned in every frame along the recovered path.
 - **Light**: a soft sky, a sun from over the left shoulder of each shot's first camera (it
   stands still while the camera moves), and soft shadows, so figures cast shadows on the set.
-  The set casts none on itself, and ambient occlusion reaches 0.4 m, so walls and floors stay
-  plain, each one its own grey, lit by the way it faces, without blotches of shadow. The render
+  The set's flat surfaces cast none on each other, and ambient occlusion reaches 0.4 m, so walls
+  and floors stay plain, each one its own grey, lit by the way it faces, without blotches of
+  shadow; its mouldings and lamps cast theirs, so they stand out as modelled. The render
   is exposed 1.2 stops down (`EXPOSURE`), so the clay shows in mid greys, as a white model is
   shown, not glaring white.
 
@@ -542,7 +573,7 @@ in `WB/Props` (`Prop_01_suitcase`, …), each with its own material, to swap for
 | What counts as too dark to see, and what becomes of it (closed by the surfaces around, or a dark void) | `UNLIT`, `UNLIT_EVEN`, `UNLIT_MIN` in `pipeline/depth.py`; `FLOOR`, `CLOSE`, `OPENING` in `pipeline/planes.py`; `VOID_COLOUR`, `VOID_MARGIN`, `VOID_FAR` in `pipeline/blender/build_scene.py` |
 | How the holes people leave are closed | `BIG_PLANE`, `BEHIND`, `RUN_OFF`, `HALO`, `HALO_REACH` in `pipeline/planes.py` |
 | How the camera's path is found and smoothed | `FEATURES`, `MIN_POINTS`, `PIXEL`, `MAX_TURN`, `MAX_STEP`, `SMOOTH` in `pipeline/camera.py` |
-| How a shot is split into sets, and how each is built | `STRETCH_TURN`, `STRETCH_TRAVEL`, `MIN_STRETCH` in `pipeline/camera.py`; `CANVAS`, `NEAREST`, `SHOT_SAMPLES`, `SEEN`, `BLEND` in `pipeline/planes.py` |
+| How a shot is split into sets, and how each is built | `STRETCH_TURN`, `STRETCH_TRAVEL`, `MIN_STRETCH` in `pipeline/camera.py`; `CANVAS`, `NEAREST`, `NEAR_SEEN`, `SHOT_SAMPLES`, `SEEN`, `BLEND` in `pipeline/planes.py` |
 | Assumed lens (changes how deep the scene looks) | `LENS` in `pipeline/analyse.py` |
 | Which detections count (confidence, minimum size) | `MIN_PERSON_SCORE`, `MIN_HEIGHT` in `pipeline/figures.py` |
 | Which tracks count, how far they are carried on through less sure detections, and when two tracks are one person | `MIN_TRACK`, `TRACK_SCORE`, `TRACK_KEYPOINTS`, `POLE`, `SIDE`, `MAX_GAP`, `STITCH_GAP`, `STITCH_REACH`, `SAME_TRACK`, `SAME_POSE`, `SAME_PART`, `FAINT_SCORE`, `FAINT_IOU`, `HIDDEN`, `HOLDS` in `pipeline/figures.py` |
@@ -551,7 +582,9 @@ in `WB/Props` (`Prop_01_suitcase`, …), each with its own material, to swap for
 | When a figure starts out on all fours, and which way it faces | `CRAWL`, `CRAWL_SPAN`, `FACING` in `pipeline/mannequin.py` |
 | Figure proportions and part sizes | `HEIGHT`, `TORSO`, `LIMBS`, `PART_SIZES`, `TORSO_CENTRE`, `LIMB_PARTS` in `pipeline/mannequin.py` |
 | How many greys the set is painted in, how dark and light, and which parts of a surface get a grey of their own | `TONES`, `TONE_RANGE`, `TONE_CLIP`, `TONE_EDGE`, `TONE_SPECK`, `TONE_ROUND`, `TONE_CORE`, `TONE_SOLID` in `pipeline/planes.py` |
-| Which straight edges are drawn on the set as lines, how wide, and where they are closed into corners | `LINE_STEP`, `LINE_LEN`, `LINE_WIDTH`, `LINE_JOIN`, `LINE_CROWD`, `LINE_MEET` in `pipeline/planes.py` |
+| Which straight edges are drawn on the set as lines, how wide, and where they are closed into corners | `LINE_STEP`, `LINE_LEN`, `LINE_WIDTH`, `LINE_JOIN`, `LINE_CROWD`, `LINE_BUNDLE`, `LINE_MEET` in `pipeline/planes.py` |
+| How far the set's mouldings stand out, and which round parts become balls | `RELIEF_LINE`, `RELIEF_BALL`, `RELIEF_GLOW` in `pipeline/planes.py`; `FLOOR_RELIEF`, `BALL_FLOOR` in `pipeline/blender/build_scene.py` |
+| Which things in the set keep a colour of their own, and how vivid it is painted | `ITEM_VIVID`, `ITEM_APART`, `ITEM_MAX`, `ITEM_CHROMA` in `pipeline/planes.py` |
 | Which things count as carried (what, how sure, how big, held by whom), and when two tracks are one thing | `PROPS`, `MIN_PROP_SCORE`, `MIN_PROP_SIZE`, `MAX_PROP_AREA`, `PROP_PERSON`, `PROP_TRACK_SCORE`, `SAME_THING`, `KINDS`, `SAME_KIND`, `CARRIED`, `HOLD`, `CARRIER` in `pipeline/figures.py`; how steady their path is, and which depth readings are taken as misses: `PROP_STEADY`, `PROP_JUMP` in `pipeline/analyse.py` |
 | Figure, visor, prop and set colours; how bright the render is; prop shapes; bevel; which set squares become one face | `FIGURE_COLOUR`, `VISOR_COLOUR`, `PROP_COLOURS`, `EXPOSURE`, `ROUND`, `UPRIGHT`, `PROP_DEPTH`, `SET_COLOUR`, `BEVEL`, `BLOCK`, `FLAT`, `EDGE_ON`, `BACK`, `LEDGE`, `LEDGE_GAP` in `pipeline/blender/build_scene.py` |
 | Light and render samples | the light and render sections at the end of `build_scene.py` |
@@ -595,6 +628,8 @@ Interactive reference: <http://localhost:8000/docs>.
 | Rows of faint dashes or thin stripes on walls and figures | Part of a set reaches very far away (kilometres), which spreads the sun's shadows too thin. Hole fills are kept near what is around them for this reason; if it shows, look in the `.blend` for set vertices far from the camera |
 | The page will not open | The server is not running; start it (section 4) |
 | An old video shows a different look | It was processed by an earlier version; upload it again |
+| A ball stands on a wall where there is no lamp, or a lamp stays flat | Balls are parts nearly round that stand at least `RELIEF_GLOW` of the greys apart from what is round them; raise it for fewer balls (only the brightest lamps), lower it for more (a lit patch of wall can then become one). `RELIEF_BALL` is how round a part must be |
+| Something in the set is coloured that should be grey, or an item stays grey | Items are what is at least `ITEM_VIVID` vivid, `ITEM_APART` unlike the set's own colour and at most `ITEM_MAX` of the picture, in `planes.py`; raise the first two (or lower the last) to colour less, lower them to colour more |
 | Set looks cut-out or blocky in places | What lies on no flat surface becomes flat cards in its own outline (`CARD_JUMP`, `CARD_MIN` in `pipeline/planes.py`). Dark, blurry or very low-resolution footage carries little depth detail, so fewer planes are found and more of the set is cards |
 | A dark doorway or corner is a dark, empty void in the white model | It was too dark to see in most frames, and the surfaces around it could not close it (section 2, *The dark*). Lower `CLOSE` in `planes.py` to close more of the dark with the surfaces around it; lowering `UNLIT` in `depth.py` makes less count as too dark, but the depth the model makes up there then shows as shards |
 | `uv` fails with "os error 17" inside the Claude desktop app | Set `$env:UV_CACHE_DIR = "C:\Users\kakssjs\.cache\uv"` first (not needed in a normal terminal) |
@@ -605,6 +640,35 @@ The full error text of a failed job is in `jobs/<id>/job.json`.
 ---
 
 ## 8. What was verified
+
+**A modelled set, and the set's own coloured items** (2026-11-25, on the same GPU). Checked on
+the hall (the reference video) from the command line, against the committed code's run, the
+original and the reference white model:
+
+- **Full run with relief and colour** (dev pass, Blender build, render), at frames 61, 206,
+  281, 400, 560 and 701. The window's grid, the staircase's rail and the radiator's fins stand
+  out as mouldings and cast shadows; the hanging globe lamps are balls, as in the reference
+  (both at frame 281); the small yellow desk lamp at the counter is painted yellow (frames 400,
+  560, 701). The same 7 figures, props and 5 sets as before. The first try also made balls of
+  two lit patches of wall (frames 206 and 281); `RELIEF_GLOW` leaves them out.
+- **Found in that run, and fixed:** the big yellow desk lamp at the counter's right edge was
+  missing from the set: it stands 8–10% as far from the camera as the room, under `NEAREST`,
+  so no frame placed it. With `NEAR_SEEN`, that shot's set, rebuilt, has it in its outline and
+  colour; where the rest of the set's depth changed (the plane search given more points), it
+  changed by a median 5%, and the walls, counter and alcove keep their layout. The left
+  handrail on the stairs was a bundle of about a dozen mouldings at slightly different angles
+  (its two edges, its shadow, the lit patch beside it); with `LINE_BUNDLE` it is about three,
+  and the stair shot's three sets have 90, 58 and 77 lines instead of 136, 79 and 103. A ball
+  on that shot's floor (a lit patch) is left out by `BALL_FLOOR`: its surface faces straight up,
+  while the lamps' surfaces face the camera or down (the ceiling). The small desk lamp's surface
+  (the counter top) faces up too, so a ball on such a surface is kept where it is an item of its
+  own colour; built in Blender from the hall's sets, it keeps its ball.
+- **Colour on the other clips**, on their frames' colour: the corridor and the studio lot have
+  nothing vivid and unlike their grade; on the rooftop clip small yellow taxis may be coloured.
+
+Not verified: the last three changes (`NEAR_SEEN`, `LINE_BUNDLE`, `BALL_FLOOR`) were checked on
+the hall's rebuilt sets only, not yet built and rendered in Blender, and the corridor, studio
+and rooftop clips were not run with this version.
 
 **Faint people carried on** (2026-11-25, on the same GPU). Of the two men crawling one behind the
 other at the hall's counter (frames 490–787), the second had a figure only at frames 565–609,
@@ -867,7 +931,8 @@ Not verified:
   frame's side, for most of the time they are seen; lower `POLE` in `figures.py` if it does.
 - **Only held things become props, and only while the detector sees them.** A bag in shadow
   or mostly behind a leg can be lost for seconds, and is not drawn then; a thing nobody holds
-  stays grey in the set. Items are numbered, and coloured, in the order they first appear, not
+  stays part of the set, grey unless its own colour is vivid and unlike the set's (see Colour
+  in section 2). Items are numbered, and coloured, in the order they first appear, not
   by kind, and a thing found again is taken to be the last one of its kind seen, so two bags,
   one lost from view as the other appears, are drawn as one item. A depth reading that is wrong
   in more than two of five frames in a row is not caught, and the thing is placed at that depth.

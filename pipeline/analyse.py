@@ -112,12 +112,16 @@ class Store:
         self.sky = np.lib.format.open_memmap(folder / "sky.npy", "w+", np.uint8, (frames, h, (w + 7) // 8))
         self.dark = np.lib.format.open_memmap(folder / "dark.npy", "w+", np.uint8, (frames, h, (w + 7) // 8))
         self.grey = np.lib.format.open_memmap(folder / "grey.npy", "w+", np.uint8, (frames, h, w))
+        self.chroma = np.lib.format.open_memmap(folder / "chroma.npy", "w+", np.uint8,
+                                                (frames, (h + 1) // 2, (w + 1) // 2, 2))
 
-    def put(self, i, depth=None, hole=None, sky=None, dark=None, grey=None):
+    def put(self, i, depth=None, hole=None, sky=None, dark=None, grey=None, chroma=None):
         if depth is not None:
             self.depth[i] = depth
         if grey is not None:
             self.grey[i] = grey
+        if chroma is not None:
+            self.chroma[i] = chroma
         if hole is not None:
             self.hole[i] = np.packbits(hole, axis=1)
         if sky is not None:
@@ -134,12 +138,15 @@ class Store:
         """Where frame i is too dark to see (see depth.unlit)."""
         return np.unpackbits(self.dark[i], axis=1, count=self.w).astype(bool)
 
-    def get_grey(self, i):
-        """Frame i in grey levels (uint8), at the depth maps' size."""
-        return np.array(self.grey[i])
+    def get_levels(self, i):
+        """Frame i in grey levels (see depth.grey) and colour (Lab a, b, see depth.chroma), (h, w, 3)
+        uint8 at the depth maps' size."""
+        grey = self.grey[i]
+        h, w = grey.shape
+        return np.dstack((grey, cv2.resize(np.asarray(self.chroma[i]), (w, h), interpolation=cv2.INTER_LINEAR)))
 
     def close(self):
-        del self.depth, self.hole, self.sky, self.dark, self.grey
+        del self.depth, self.hole, self.sky, self.dark, self.grey, self.chroma
         gc.collect()
 
 
@@ -368,7 +375,8 @@ def look(src, meta, cuts, total, work, device):
             hole = planes.hole_mask(masks[:len(found)] + [m for p, m in zip(items, masks[len(found):])
                                                          if figures.held(p["box"], found)], depth)
             tracker(planes.motion_view(frame, hole, sky), i in cuts)
-            store.put(i, depth, hole, sky, dp.unlit(frame, depth.shape), dp.grey(frame, depth.shape))
+            store.put(i, depth, hole, sky, dp.unlit(frame, depth.shape), dp.grey(frame, depth.shape),
+                      dp.chroma(frame, depth.shape))
             people.append(found)
             things.append(items)
             faint.append(unsure)
@@ -483,8 +491,11 @@ def build_sets(store, shots, tracker, sets_dir, device):
     inverse depth in the shot's units on a picture in its keyframe's view, 0 where there is none
     (sky) and -1 where it is left empty for being too dark to see; sets_dir/NNN_edges.npz:
     where the pixels along its outlines lie on the straight lines the outlines were drawn as, and
-    which surface each pixel is on (planes.outline_shifts); and sets_dir/NNN_tone.png: the set
-    painted in the footage's light and dark (planes.set_tones), in one spread of greys for the shot.
+    which surface each pixel is on (planes.outline_shifts); sets_dir/NNN_tone.png: the set
+    painted in the footage's light and dark (planes.set_tones), in one spread of greys for the shot,
+    and what in it has a vivid colour of its own in that colour (an item to replace); and
+    sets_dir/NNN_relief.npz: its straight edges and round parts, to stand out from it as
+    mouldings and balls (planes.set_tones).
     Returns per shot its camera path (camera poses), the typical distance to what the camera
     sees and its sets; and per frame the factor that took the depth model's scale to the shot's
     (shot depth = model depth / factor)."""
@@ -502,21 +513,23 @@ def build_sets(store, shots, tracker, sets_dir, device):
             lo, hi = max(0, a - planes.BLEND // 2), min(n, b + planes.BLEND // 2)
             got = cleaner.splat(lambda t: store.get(s + lo + t), [camera.relative(poses[t], poses[key])
                                                                  for t in range(lo, hi)], key - lo,
-                                lambda t: store.get_dark(s + lo + t), lambda t: store.get_grey(s + lo + t))
+                                lambda t: store.get_dark(s + lo + t), lambda t: store.get_levels(s + lo + t))
             if got is None:         # no set could be built here (all people, or a whip pan): none shown
                 continue
-            depth, centre, grey = got
+            depth, centre, levels = got
             np.save(sets_dir / f"{number:03d}.npy", depth)
             at, across, down, moved, piece = planes.outline_shifts(depth)
             np.savez_compressed(sets_dir / f"{number:03d}_edges.npz", at=at, across=across, down=down, q=moved,
                                 piece=piece)
-            greys.append((number, grey, depth, piece))
+            greys.append((number, levels, depth, piece))
             sets.append({"file": f"{number:03d}.npy", "first": s + a, "last": s + b - 1, "centre": centre,
                          "key": poses[key][:2]})
             number += 1
-        spread = planes.tone_spread([g for _, g, _, _ in greys])      # (one for the shot's sets)
-        for k, grey, q, piece in greys:
-            cv2.imwrite(str(sets_dir / f"{k:03d}_tone.png"), planes.set_tones(grey, q, piece, spread))
+        spread = planes.tone_spread([g[..., 0] for _, g, _, _ in greys])      # (one for the shot's sets)
+        for k, levels, q, piece in greys:
+            tone, relief = planes.set_tones(levels[..., 0], q, piece, spread, levels[..., 1:])
+            cv2.imwrite(str(sets_dir / f"{k:03d}_tone.png"), cv2.cvtColor(tone, cv2.COLOR_RGB2BGR))
+            np.savez_compressed(sets_dir / f"{k:03d}_relief.npz", **relief)
         info.append({"poses": [p[:2] for p in poses], "typical": float(np.median(dists)), "sets": sets})
     return info, factors
 

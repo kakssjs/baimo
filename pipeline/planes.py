@@ -80,9 +80,23 @@ LINE_JOIN = (3.0, 0.03)   # pieces of one line the detector finds apart (in line
 LINE_CROWD = (0.04, 5.0)  # a line crossing a square this share of the picture's width wide with more than this many
                           # lines on average is hatching (the grain of a surface, a far facade's rows of windows,
                           # a radiator's fins), not an outline, and is not drawn
+LINE_BUNDLE = (15.0, 0.02)  # a line within this many degrees of a longer one, its middle beside it within this share
+                            # of the picture's width, is another edge of the same thing (a rail's two edges, its
+                            # shadow on the wall) and is not drawn: one line, and one moulding, for each
 LINE_MEET = (30.0, 0.03)  # lines at least this many degrees apart that would meet within this share of the picture's
                           # width of their ends are carried on, or cut back, to where they meet: a frame closed at
                           # its corners
+RELIEF_LINE = 2.0     # the set's straight edges also stand out from it as mouldings this many line widths
+                      # (LINE_WIDTH) wide and proud, and ...
+RELIEF_BALL = 0.75    # ... a part drawn as its convex outline (TONE_SOLID) that fills at least this share of the
+RELIEF_GLOW = 3       # circle round it, and is at least this many of the TONES lighter or darker than what is round
+                      # it (a lamp against its wall, not a lit patch of the wall), as a ball, so that they catch the
+                      # light and cast soft shadows, as a modelled set's frames, panels and lamps do (see set_tones)
+ITEM_VIVID = 45.0     # a part of the set at least this vivid (Lab chroma) and at least ...
+ITEM_APART = 30.0     # ... this far in colour from the set's own (its median: the film's grade), over at least
+ITEM_MAX = 0.03       # TONE_SPECK and at most this share of the picture, is an item of a colour of its own (a yellow
+ITEM_CHROMA = 60.0    # desk lamp): painted in that colour, this vivid, at its grey's lightness, so that a template
+                      # shows it as an item to replace, as it does what people carry (see set_tones)
 CREASE_GAP = 0.03     # planes that meet at an angle (CREASE_ANGLE or more apart) and lie within this share of
 CREASE_ANGLE = 10.0   # each other in depth along their seam are cut along the line where they meet (a room's
 CREASE_REACH = 0.02   # corner, a box's edge), where it runs within this share of the frame width of the seam
@@ -114,7 +128,9 @@ OPENING = 0.75        # lies behind what is around it (inverse depth under this 
 SEEDS, SAMPLE = 384, 16384
 MOTION_WIDTH = 480    # frames are matched at this width to follow the camera
 CANVAS = 2.5          # a stretch is laid onto one picture at most this many frames wide and high, ...
-NEAREST = 0.15        # ... of what is no nearer its camera than this share of the distance to what it sees
+NEAREST = 0.15        # ... of what is no nearer its camera than this share of the distance to what it sees, ...
+NEAR_SEEN = 0.8       # ... save where its camera itself sees something that near: what lies at least this share
+                      # as far as that (a lamp just in front of the camera)
 SHOT_SAMPLES = 40     # frames whose depth is combined into that picture
 SEEN = 0.3            # ... and the share of them a spot must be seen in (not behind anyone) to count as seen
 BLEND = 12            # a stretch's set is also built from this many frames around it, half on either side
@@ -532,23 +548,80 @@ def tone_spread(greys):
     return tuple(np.percentile(seen, [TONE_CLIP, 100 - TONE_CLIP])) if len(seen) else (0.0, 255.0)
 
 
-def set_tones(g, q, piece, spread):
-    """A set's picture painted in TONES even greys, for a texture (uint8 albedo, linear): its grey
-    levels (g, see SetDepth.splat: nan where not seen; there is a set where its inverse depth q is
-    above 0) spread over TONE_RANGE from spread's low to its high (see tone_spread); each surface
-    (piece: a number per pixel, see outline_shifts) the median grey seen on it, as a set builder
-    paints a wall, and each part of it that stands out from the rest (see TONE_EDGE; trimmed to
-    its core, TONE_CORE) the median grey seen on that part, each rounded to the nearest of the
-    TONES, a part that is nearly convex drawn as its convex outline (TONE_SOLID). So walls, floors
-    and steps come out even, with no blotches where the light fell unevenly, and windows, doors,
-    lamps and rails keep the footage's light and dark. What was not seen (behind people
-    throughout) takes the grey of the nearest of its own surface that was, so no outline of them
-    shows. The set's straight edges are drawn on it as lines (see LINE_STEP, straight_edges)."""
+def _plane_at(q, piece, surface, x0, y0, x1, y1, pad):
+    """The plane of a surface (pixels where piece is surface and inverse depth q is above 0) round
+    the box x0..x1, y0..y1 grown by pad pixels, as inverse depth a + gx x + gy y (x, y in pixels):
+    (a, gx, gy), or None where too little of it is there."""
+    h, w = q.shape
+    box = (slice(max(0, int(min(y0, y1) - pad)), min(h, int(max(y0, y1) + pad) + 1)),
+           slice(max(0, int(min(x0, x1) - pad)), min(w, int(max(x0, x1) + pad) + 1)))
+    own = (piece[box] == surface) & (q[box] > 0)
+    if own.sum() < 3:
+        return None
+    y, x = np.nonzero(own)
+    x, y = x + box[1].start, y + box[0].start
+    a = np.stack((np.ones(len(x)), x, y), axis=1)
+    if np.linalg.matrix_rank(a) < 3:        # (all in one row or column: no tilt to be had across it)
+        return None
+    return np.linalg.lstsq(a, q[box][own], rcond=None)[0]
+
+
+def _items(colour, seen, albedo, disc):
+    """The parts of a set of a vivid colour of their own (ITEM_VIVID, ITEM_APART, ITEM_MAX), from its
+    colour (Lab a, b, 128 for grey; seen: where it is known), each rounded with disc and drawn as its
+    convex outline where it nearly fills it (TONE_SOLID): (box, mask in it, its paint), the paint
+    (linear RGB albedo) in the part's own hue, ITEM_CHROMA vivid, as light as albedo there (grey)."""
+    if not seen.any():
+        return []
+    a, b = colour[..., 0] - 128, colour[..., 1] - 128
+    apart = np.hypot(a - np.median(a[seen]), b - np.median(b[seen])) >= ITEM_APART
+    vivid = seen & (np.hypot(a, b) >= ITEM_VIVID) & apart
+    cc = ndimage.label(_rounded(vivid, disc) & seen)[0]
+    out = []
+    for k, box in enumerate(ndimage.find_objects(cc), 1):
+        own = cc[box] == k
+        if not TONE_SPECK * cc.size <= own.sum() <= ITEM_MAX * cc.size:
+            continue
+        hull = np.zeros(own.shape, np.uint8)
+        cv2.fillConvexPoly(hull, cv2.convexHull(cv2.findNonZero(own.astype(np.uint8))), 1)
+        if own.sum() >= TONE_SOLID * hull.sum():
+            own = hull > 0
+        hue = np.arctan2(np.median(b[box][own & seen[box]]), np.median(a[box][own & seen[box]]))
+        y = float(np.median(albedo[box][own]))
+        lab = np.array([[[116 * y ** (1 / 3) - 16, ITEM_CHROMA * np.cos(hue), ITEM_CHROMA * np.sin(hue)]]], np.float32)
+        rgb = np.clip(cv2.cvtColor(lab, cv2.COLOR_Lab2RGB)[0, 0], 0, 1)        # (sRGB, which is ...)
+        out.append((box, own, np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)))  # (... linear)
+    return out
+
+
+def set_tones(g, q, piece, spread, colour=None):
+    """A set's picture painted in TONES even greys, for a texture ((h, w, 3) uint8 albedo, linear
+    RGB): its grey levels (g, see SetDepth.splat: nan where not seen; there is a set where its
+    inverse depth q is above 0) spread over TONE_RANGE from spread's low to its high (see
+    tone_spread); each surface (piece: a number per pixel, see outline_shifts) the median grey
+    seen on it, as a set builder paints a wall, and each part of it that stands out from the rest
+    (see TONE_EDGE; trimmed to its core, TONE_CORE) the median grey seen on that part, each
+    rounded to the nearest of the TONES, a part that is nearly convex drawn as its convex outline
+    (TONE_SOLID). So walls, floors and steps come out even, with no blotches where the light fell
+    unevenly, and windows, doors, lamps and rails keep the footage's light and dark. What was not
+    seen (behind people throughout) takes the grey of the nearest of its own surface that was, so
+    no outline of them shows. The set's straight edges are drawn on it as lines (see LINE_STEP,
+    straight_edges).
+    Given its colour (Lab a, b, see depth.chroma; nan where not seen), what has a vivid colour of
+    its own is painted in that colour (see ITEM_VIVID, _items).
+
+    Also returns the set's relief (RELIEF_LINE, RELIEF_BALL, RELIEF_GLOW), each piece of it on
+    the plane of the surface it lies on: "lines", the straight edges, x0, y0, x1, y1 (pixels), q0,
+    q1 (inverse depth at the ends), gx, gy (the surface's inverse depth per pixel across and down)
+    each; "balls", the round parts, x, y, radius (pixels), q, gx, gy, and 1 where it is an item
+    of a colour of its own (else 0) each; and "width", the mouldings' width in pixels."""
     valid = q > 0
     ok = valid & np.isfinite(g)
     observed = ok.copy()
+    width = RELIEF_LINE * max(1, round(LINE_WIDTH * q.shape[1]))
     if not ok.any():
-        return np.full(g.shape, round(np.mean(TONE_RANGE) * 255), np.uint8)
+        return (np.full(g.shape + (3,), round(np.mean(TONE_RANGE) * 255), np.uint8),
+                {"lines": np.zeros((0, 8)), "balls": np.zeros((0, 7)), "width": width})
     lo, hi = spread
     t = np.clip((np.where(ok, g, lo) - lo) / max(hi - lo, 1.0), 0, 1)
     lab = np.where(ok, piece, 0).astype(np.int64)
@@ -572,6 +645,7 @@ def set_tones(g, q, piece, spread):
     # (TONE_ROUND): parts of their own.
     part = np.zeros(t.shape, np.int64)
     disc = _disc(max(1, round(TONE_ROUND * t.shape[1])))
+    balls = []
     for dev in (t - trend, trend - t):          # (lighter parts, then darker)
         side = _rounded((dev >= TONE_EDGE) & (lab > 0), disc) & (lab > 0)
         cc = ndimage.label(side)[0]
@@ -590,9 +664,13 @@ def set_tones(g, q, piece, spread):
                 new[box][own] = 0
                 continue
             hull = np.zeros(own.shape, np.uint8)
-            cv2.fillConvexPoly(hull, cv2.convexHull(cv2.findNonZero(own.astype(np.uint8))), 1)
+            points = cv2.findNonZero(own.astype(np.uint8))
+            cv2.fillConvexPoly(hull, cv2.convexHull(points), 1)
             if own.sum() >= TONE_SOLID * hull.sum():    # (on its own surface, where no other part is)
                 new[box][(hull > 0) & (lab[box] == lab[box][own][0]) & (part[box] == 0) & (new[box] == 0)] = k
+                (bx, by), r = cv2.minEnclosingCircle(points)
+                if hull.sum() >= RELIEF_BALL * np.pi * r * r:
+                    balls.append((bx + box[1].start, by + box[0].start, r, lab[box][own][0]))
         part = np.where(new > 0, part.max() + new, part)
     region = np.where(part > 0, part + n, lab)          # (surfaces 1..n-1, parts beyond)
     region = np.unique(region, return_inverse=True)[1].reshape(t.shape)
@@ -616,24 +694,50 @@ def set_tones(g, q, piece, spread):
         _, (iy, ix) = ndimage.distance_transform_edt(~ok, return_indices=True)     # edges blend with
         out = out[iy, ix]                                                           # nothing else)
     step = (TONE_RANGE[1] - TONE_RANGE[0]) / (TONES - 1)
-    out = np.where(straight_edges(t, observed, piece, q),
-                   np.where(out > TONE_RANGE[0] + step / 2, out - step, out + step), out)
-    return np.round(out * 255).astype(np.uint8)
+    round_ = []
+    h, w = out.shape
+    for x, y, r, surface in balls:
+        box = (slice(max(0, int(y - 2 * r)), min(h, int(y + 2 * r) + 1)),
+               slice(max(0, int(x - 2 * r)), min(w, int(x + 2 * r) + 1)))
+        yy, xx = np.ogrid[box]
+        d2 = (xx - x) ** 2 + (yy - y) ** 2          # (its middle against a ring round it, on the set)
+        inside = out[box][d2 <= (0.6 * r) ** 2]
+        around = out[box][(d2 > (1.3 * r) ** 2) & (d2 <= 4 * r * r) & valid[box]]
+        if (not len(inside) or not len(around)
+                or abs(np.median(inside) - np.median(around)) < (RELIEF_GLOW - 0.5) * step):
+            continue
+        plane = _plane_at(q, piece, surface, x - r, y - r, x + r, y + r, 2 * r)
+        if plane is not None and plane @ (1, x, y) > 0:
+            round_.append((x, y, r, plane @ (1, x, y), plane[1], plane[2]))
+    drawn, lines = straight_edges(t, observed, piece, q)
+    out = np.where(drawn, np.where(out > TONE_RANGE[0] + step / 2, out - step, out + step), out)
+    out = np.repeat(out[..., None], 3, axis=2)
+    item = np.zeros((h, w), bool)
+    if colour is not None:
+        for box, own, paint in _items(colour, valid & np.isfinite(colour).all(axis=2), out[..., 0], disc):
+            out[box][own] = paint
+            item[box] |= own
+    round_ = [b + (float(item[min(h - 1, int(b[1])), min(w - 1, int(b[0]))]),) for b in round_]   # (on an item?)
+    return (np.round(out * 255).astype(np.uint8),
+            {"lines": lines, "balls": np.array(round_, np.float64).reshape(-1, 7), "width": width})
 
 
 def straight_edges(t, seen, piece, q):
     """Where the set's straight edges run, to draw (see LINE_STEP): the lines a line segment
     detector finds in its grey (t, 0..1; seen: where it was seen, the rest as the nearest seen, so
     no edge runs along people), kept where the grey differs across them by LINE_STEP, joined
-    (LINE_JOIN), at least LINE_LEN long and closed where they meet at an angle (LINE_MEET); a mask
+    (LINE_JOIN), at least LINE_LEN long, one of each bundle that runs alongside each other
+    (LINE_BUNDLE) and closed where they meet at an angle (LINE_MEET); a mask
     of lines LINE_WIDTH wide, where seen. A line within one surface (piece) is drawn on it; one
     where two surfaces meet is drawn along the edge of the nearer (q: inverse depth), as its
     outline, so that it moves with it as the camera moves rather than lying half on what is
-    behind it."""
+    behind it. Also returns each stretch of a line that runs over one surface where seen, on that
+    surface's plane, for its relief (see set_tones)."""
     h, w = t.shape
     mask = np.zeros((h, w), bool)
+    runs = []
     if not seen.any():
-        return mask
+        return mask, np.zeros((0, 8))
     _, (iy, ix) = ndimage.distance_transform_edt(~seen, return_indices=True)
     found = cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD).detect(np.round(t[iy, ix] * 255).astype(np.uint8))[0]
     off = max(2.0, 1.25 * LINE_WIDTH * w)       # (pixels either side at which each side's grey is read)
@@ -674,6 +778,8 @@ def straight_edges(t, seen, piece, q):
         if np.hypot(x1 - x0, y1 - y0) >= LINE_LEN * w and np.mean(crowd[along]) <= LINE_CROWD[1]:
             lines.append((x0, y0, x1, y1))
             on.append(np.unique(own[group == k]))       # (the surfaces its pieces are drawn on)
+    kept = _bundle(np.array(lines, np.float64).reshape(-1, 4), w)
+    lines, on = [lines[k] for k in kept], [on[k] for k in kept]
     pad = width + 1
     for (x0, y0, x1, y1), surfaces in zip(np.round(_meet(np.array(lines, np.float64).reshape(-1, 4), w)).astype(int),
                                           on):
@@ -684,7 +790,42 @@ def straight_edges(t, seen, piece, q):
         line = np.zeros((box[0].stop - box[0].start, box[1].stop - box[1].start), np.uint8)
         cv2.line(line, (x0 - box[1].start, y0 - box[0].start), (x1 - box[1].start, y1 - box[0].start), 1, width)
         mask[box] |= (line > 0) & np.isin(piece[box], surfaces)        # (on those surfaces only)
-    return mask & seen
+        s = np.linspace(0, 1, max(2, int(np.hypot(x1 - x0, y1 - y0)) + 1))
+        x, y = x0 + s * (x1 - x0), y0 + s * (y1 - y0)
+        at = np.clip(np.round(y).astype(int), 0, h - 1), np.clip(np.round(x).astype(int), 0, w - 1)
+        for surface in surfaces:
+            stay = np.concatenate([[False], (piece[at] == surface) & seen[at] & (q[at] > 0), [False]])
+            for a, b in np.flatnonzero(np.diff(stay.astype(np.int8))).reshape(-1, 2):      # (each stretch on it)
+                if np.hypot(x[b - 1] - x[a], y[b - 1] - y[a]) < LINE_LEN * w / 2:
+                    continue
+                plane = _plane_at(q, piece, surface, x[a], y[a], x[b - 1], y[b - 1], 2 * width + 2)
+                if plane is None:
+                    continue
+                q0, q1 = plane @ (1, x[a], y[a]), plane @ (1, x[b - 1], y[b - 1])
+                if q0 > 0 and q1 > 0:
+                    runs.append((x[a], y[a], x[b - 1], y[b - 1], q0, q1, plane[1], plane[2]))
+    return mask & seen, np.array(runs, np.float64).reshape(-1, 8)
+
+
+def _bundle(lines, w):
+    """Which of lines (each x0, y0, x1, y1, in a picture w pixels wide) to keep, in order: all but
+    those that run alongside a longer one (LINE_BUNDLE), so that a rail's two edges and its shadow
+    are drawn as one line."""
+    angle, reach = LINE_BUNDLE
+    length = np.hypot(lines[:, 2] - lines[:, 0], lines[:, 3] - lines[:, 1])
+    keep = []
+    for i in np.argsort(-length, kind="stable"):
+        mid = (lines[i, :2] + lines[i, 2:]) / 2
+        d = (lines[i, 2:] - lines[i, :2]) / max(length[i], 1e-9)
+        for j in keep:
+            e = (lines[j, 2:] - lines[j, :2]) / max(length[j], 1e-9)
+            rel = mid - lines[j, :2]
+            if (abs(d @ e) >= np.cos(np.radians(angle)) and abs(rel[0] * e[1] - rel[1] * e[0]) <= reach * w
+                    and -reach * w <= rel @ e <= length[j] + reach * w):
+                break
+        else:
+            keep.append(i)
+    return sorted(keep)
 
 
 def _meet(lines, w):
@@ -851,12 +992,13 @@ class SetDepth:
         frames(t) -> (depth, hole, sky) for t in range(len(poses)); poses[t] = (R, T, factor) of
         frame t relative to the keyframe (see camera.relative); dark(t), if given, -> where frame
         t is too dark to see (see depth.unlit), or None; grey(t), if given, -> frame t in grey
-        levels (see depth.grey), which are laid onto the picture the same way. Returns the
-        picture's inverse depth (0 where there is no set: sky, or never seen; -1 where it is left
-        empty for the dark), its principal point (cx, cy) in pixels from its top-left corner (same
-        focal length as the frames') and, given grey, the median grey level seen at each of its
-        pixels (nan where it was behind people, or not seen; else None); or None if too little of it
-        is seen.
+        levels (see depth.grey), (h, w), or with more channels (its colour), (h, w, c), which are
+        laid onto the picture the same way. Returns the picture's inverse depth (0 where there is
+        no set: sky, or never seen; -1 where it is left empty for the dark), its principal point
+        (cx, cy) in pixels from its top-left corner (same focal length as the frames') and, given
+        grey, the median of each channel seen at each of its pixels, (h, w, c) (c = 1 for grey
+        levels alone; nan where it was behind people, or not seen; else None); or None if too
+        little of it is seen.
         """
         dev = self.device
         n = len(poses)
@@ -864,9 +1006,13 @@ class SetDepth:
         h, w = depth.shape
         f = self.lens_ratio * w
         # Points much nearer the keyframe's camera than what it looks at are seen at too steep an
-        # angle from it to place well (the side walls next to a camera that pulls back): left out.
+        # angle from it to place well (the side walls next to a camera that pulls back): left out,
+        # save where the keyframe itself sees something that near (NEAR_SEEN: a lamp just in front
+        # of the camera, which it places as it sees it).
         ok = np.isfinite(depth) & (depth > 0) & ~hole & (True if sky is None else ~sky)
         nearest = NEAREST * float(np.median(depth[ok])) / poses[key][2] if ok.any() else 1e-3
+        key_z = torch.from_numpy(np.where(np.isfinite(depth) & (depth > 0), depth / poses[key][2],
+                                          np.inf).astype(np.float32)).to(dev)     # (its own depth, shot units)
         ys, xs = torch.meshgrid((torch.arange(h, device=dev) + 0.5 - h / 2) / f,
                                 (torch.arange(w, device=dev) + 0.5 - w / 2) / f, indexing="ij")
         rays = torch.stack((xs, ys, torch.ones_like(xs)), -1)      # (h, w, 3), camera space
@@ -883,9 +1029,12 @@ class SetDepth:
         def project(p):
             """Keyframe-view pixel coordinates (from the top-left corner) and inverse depth of points."""
             z = p[..., 2]
-            ahead = z > nearest
-            zs = torch.where(ahead, z, torch.ones_like(z))
-            return f * p[..., 0] / zs + w / 2, f * p[..., 1] / zs + h / 2, torch.where(ahead, 1.0 / zs, torch.zeros_like(z))
+            zs = torch.where(z > 0, z, torch.ones_like(z))
+            u, v = f * p[..., 0] / zs + w / 2, f * p[..., 1] / zs + h / 2
+            inside = (z > 0) & (u >= 0) & (u < w) & (v >= 0) & (v < h)
+            there = key_z[v.long().clamp(0, h - 1), u.long().clamp(0, w - 1)]     # (what the keyframe sees there)
+            ahead = (z > nearest) | (inside & (z >= NEAR_SEEN * there))
+            return u, v, torch.where(ahead, 1.0 / zs, torch.zeros_like(z))
 
         picks = np.unique(np.linspace(0, n - 1, min(n, SHOT_SAMPLES)).round().astype(int))
         picks = sorted(picks, key=lambda t: abs(t - key))
@@ -922,7 +1071,7 @@ class SetDepth:
             return torch.cat(idx), torch.cat(val)
 
         stack = np.full((len(picks), ch, cw), np.nan, np.float32)
-        greys = None if grey is None else np.full((len(picks), ch, cw), np.nan, np.float32)
+        greys = None        # (made at the first frame, with as many channels as grey gives)
         count = torch.zeros(ch * cw, device=dev, dtype=torch.int32)
         looks = torch.zeros(ch * cw, device=dev, dtype=torch.int32)
         sky_votes = torch.zeros(ch * cw, device=dev, dtype=torch.int32)
@@ -950,12 +1099,15 @@ class SetDepth:
             q.scatter_reduce_(0, idx, val, "amax")      # where the frame saw two things, the nearer
             seen = torch.zeros(ch * cw, device=dev, dtype=torch.bool)
             seen[idx] = True
-            if greys is not None:                       # (the grey of that nearer thing)
-                _, level = splat(p[background], torch.from_numpy(grey(t)).to(dev)[background].float())
+            if grey is not None:                        # (the grey of that nearer thing)
+                levels = np.atleast_3d(grey(t))         # (h, w, channels)
+                if greys is None:
+                    greys = np.full((len(picks), ch, cw, levels.shape[2]), np.nan, np.float32)
+                _, level = splat(p[background], torch.from_numpy(levels).to(dev)[background].float())
                 front = val >= q[idx]
-                g = torch.full((ch * cw,), float("nan"), device=dev)
+                g = torch.full((ch * cw, levels.shape[2]), float("nan"), device=dev)
                 g[idx[front]] = level[front]
-                greys[k] = g.view(ch, cw).cpu().numpy()
+                greys[k] = g.view(ch, cw, -1).cpu().numpy()
             body = torch.from_numpy(_body_depth(dn, proper & finite & ~sky)).to(dev)
             pidx, pval = splat(place(t, body)[person])
             people.scatter_reduce_(0, pidx, pval, "amin")
@@ -978,7 +1130,7 @@ class SetDepth:
                 dark_votes += dark_here
             stack[k] = torch.where(seen, q, torch.full_like(q, float("nan"))).view(ch, cw).cpu().numpy()
         def median(stack):
-            out = np.empty((ch, cw), np.float32)
+            out = np.empty(stack.shape[1:], np.float32)
             for r0 in range(0, ch, 128):
                 part = torch.from_numpy(np.ascontiguousarray(stack[:, r0:r0 + 128])).to(dev)
                 out[r0:r0 + 128] = part.nanmedian(0).values.cpu().numpy()
@@ -1027,7 +1179,8 @@ class SetDepth:
         depth = np.where(sky_c, 0, out_q.cpu().numpy()).astype(np.float32)
         # (where the set was closed behind people, what the few frames that saw it there show is
         # likely someone whose outline was missed: not seen, like what no frame saw)
-        return depth, centre, None if gc_ is None else np.where(known & (depth > 0), gc_, np.nan).astype(np.float32)
+        return depth, centre, None if gc_ is None else np.where((known & (depth > 0))[..., None], gc_,
+                                                                 np.nan).astype(np.float32)
 
     def _planes(self, q, hole, sky, f, area, min_plane=None, unlit=None):
         """Find the view's planes, none smaller than min_plane of a frame (MIN_PLANE if None), and

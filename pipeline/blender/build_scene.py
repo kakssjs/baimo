@@ -7,8 +7,10 @@ The scene is in metres, z up; each shot starts with the camera at the origin loo
   Sets     a mesh per stretch of a shot, standing still while the camera moves through it: every
            pixel of the set's picture (sets/NNN.npy, inverse depth seen from its keyframe) is a
            vertex out along its line of sight, flat surfaces merged into single faces, painted in
-           the footage's light and dark (sets/NNN_tone.png). Each is shown only during its
-           stretch; the next one takes over from it in one frame.
+           the footage's light and dark (sets/NNN_tone.png), its straight edges standing out from
+           it as mouldings and its round parts as balls (sets/NNN_relief.npz), which catch the
+           light and cast shadows. Each is shown only during its stretch; the next one takes over
+           from it in one frame.
            What was too dark to see (-1 in the picture) is a dark, unlit backdrop behind it.
   Figures  a sphere-and-box mannequin per tracked person: every part keeps one size throughout
            and is placed and turned in every frame as scene.json says.
@@ -48,6 +50,10 @@ BACK = 4                   # ... and is laid on what lies furthest back within t
 LEDGE = 0.1                # the top of something level with the camera (a tread, a landing): near below far,
 LEDGE_GAP = 0.4            # the sight line between them at most this steeply down (tangent), and the far side
                            # at most this share further back
+FLOOR_RELIEF = 0.3         # a moulding on a floor or ceiling stands this share as proud as one on a wall
+BALL_FLOOR = 0.7           # a round part on a surface facing up more than this (the upward part of its normal: a
+                           # floor) is a patch of light, not a lamp, and gets no ball, unless it is in a colour of its
+                           # own (a desk lamp on a counter)
 VOID_MARGIN = 0.03         # share of a set's width its dark backdrop reaches in behind the set's edges ...
 VOID_FAR = 2.0             # ... and it stands this many times as far back as the farthest of the set
 BEVEL = 0.012
@@ -231,6 +237,73 @@ def set_mesh(name, q, cx, cy, focal, edges=None):
     return me
 
 
+def relief_mesh(name, relief, shape, cx, cy, focal):
+    """A set's relief (sets/NNN_relief.npz, see planes.set_tones) as a mesh in the set's space: each
+    straight edge a moulding, a box as wide and as proud as relief["width"] pixels where it lies
+    (less proud on a floor or ceiling, FLOOR_RELIEF, so no one trips on it), and each round part
+    a ball sitting on its surface (none on a floor unless coloured, BALL_FLOOR). Their corners take
+    the picture's tone where they lie, so they keep the lines' and lamps' light and dark, now
+    catching the light."""
+    rows, cols = shape
+    verts, quads, uv = [], [], []
+
+    def point(x, y, q):
+        """A picture's pixel at inverse depth q, in the set's space."""
+        z = 1.0 / q
+        return np.array(((x + 0.5 - cx) / focal * z, z, -(y + 0.5 - cy) / focal * z))
+
+    def facing(x, y, q, gx, gy):
+        """The normal of the plane through (x, y, q) with these slopes, towards the camera."""
+        k = q - gx * (x + 0.5 - cx) - gy * (y + 0.5 - cy)
+        n = -np.array((gx * focal, k, -gy * focal))
+        return n / max(np.linalg.norm(n), 1e-12)
+
+    for x0, y0, x1, y1, q0, q1, gx, gy in relief["lines"]:
+        a, b = point(x0, y0, q0), point(x1, y1, q1)
+        n = facing(x0, y0, q0, gx, gy)
+        along = b - a
+        side = np.cross(along, n)
+        if np.linalg.norm(along) < 1e-9 or np.linalg.norm(side) < 1e-12:
+            continue
+        side /= np.linalg.norm(side)
+        proud = 1.0 - (1.0 - FLOOR_RELIEF) * abs(n[2])        # (a wall's in full, a floor's a little)
+        first = len(verts)
+        for end, q, x, y in ((a, q0, x0, y0), (b, q1, x1, y1)):
+            w = float(relief["width"]) / focal / q              # (as wide as the line where it lies)
+            for up in (0.0, w * proud):
+                for s in (-0.5, 0.5):
+                    verts.append(end + side * s * w + n * up)
+                    uv.append(((x + 0.5) / cols, 1.0 - (y + 0.5) / rows))
+        # corners 0..3 at a (low, low, high, high), 4..7 at b; the top, the two sides and the two ends
+        # (no bottom: it lies on the surface), each round the way that faces out
+        quads += [(first + i, first + j, first + k, first + m) for i, j, k, m in
+                  ((3, 7, 6, 2), (2, 6, 4, 0), (1, 5, 7, 3), (1, 3, 2, 0), (6, 7, 5, 4))]
+    me = bpy.data.meshes.new(name)
+    if verts:
+        me.from_pydata(np.array(verts).tolist(), [], quads)
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    layer = bm.loops.layers.uv.new("Picture")
+    for face in bm.faces:
+        for loop in face.loops:
+            loop[layer].uv = uv[loop.vert.index]
+    for x, y, r, q, gx, gy, *item in relief["balls"]:
+        n = facing(x, y, q, gx, gy)
+        if n[2] > BALL_FLOOR and not (item and item[0]):    # (a lamp hangs on a wall or from a ceiling, or
+            continue                                        # stands on a desk in a colour of its own)
+        centre = point(x, y, q)
+        radius = r / focal / q
+        made = bmesh.ops.create_uvsphere(bm, u_segments=24, v_segments=12, radius=radius)
+        bmesh.ops.translate(bm, vec=Vector(centre + n * radius), verts=made["verts"])
+        for face in {f for v in made["verts"] for f in v.link_faces}:
+            face.smooth = True
+            for loop in face.loops:
+                loop[layer].uv = ((x + 0.5) / cols, 1.0 - (y + 0.5) / rows)
+    bm.to_mesh(me)
+    bm.free()
+    return me
+
+
 def backdrop(q):
     """The picture of a set's dark backdrop: where the set was too dark to see (q < 0), and
     VOID_MARGIN of its width around that in behind the set, so that no light gap opens beside it
@@ -267,6 +340,12 @@ for number, st in enumerate(data["sets"], 1):
                                                                           st["cx"], st["cy"], st["focal"]))
         setting(back, "visible_shadow", False)      # (it stands for nothing, so it casts nothing)
         parts.append((back, void))
+    relief = os.path.join(a.sets_dir, os.path.splitext(st["file"])[0] + "_relief.npz")
+    if os.path.exists(relief):          # (a job analysed before sets had relief has none; this casts shadows)
+        with np.load(relief) as r:
+            me = relief_mesh(f"Set_{number:03d}_Relief", {k: r[k] for k in r.files}, q.shape, st["cx"], st["cy"],
+                             st["focal"])
+        parts.append((bpy.data.objects.new(f"Set_{number:03d}_Relief", me), parts[0][1]))
     setting(ob, "visible_shadow", False)    # (the set casts no shadows on itself, so its walls and floors
     for part, mat in parts:                 # stay plain, shaded by the way they face; the figures cast theirs)
         sets.objects.link(part)
